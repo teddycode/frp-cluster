@@ -1,0 +1,14 @@
+[Unit]
+Description=frps proxy server managed by frp-cluster
+After=network-online.target frp-cluster-control.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/frps -c /etc/frp/frps.toml
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

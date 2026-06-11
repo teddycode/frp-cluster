@@ -1,0 +1,15 @@
+[Unit]
+Description=frp-cluster node heartbeat agent
+After=network-online.target frp-cluster-control.service frps.service
+Wants=network-online.target
+Requires=frps.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/frp-cluster/node.env
+ExecStart=/usr/local/bin/frp-cluster agent --control-url ${NODE_CONTROL_URL} --node-id ${NODE_ID} --token ${NODE_TOKEN} --probe-size ${PROBE_SIZE}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

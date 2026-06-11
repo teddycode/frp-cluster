@@ -1,0 +1,15 @@
+[Unit]
+Description=frp-cluster managed frpc client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/frp-cluster/client.env
+ExecStart=/usr/local/bin/frp-cluster-client-run
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

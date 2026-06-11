@@ -1,0 +1,608 @@
+package control
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestJoinLeaveAndTokenLifecycle(t *testing.T) {
+	store := NewMemoryStore()
+	token, err := store.CreateJoinToken(time.Hour, 1)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+	joined, err := store.JoinNode(JoinRequest{
+		Token:      token.Token,
+		NodeID:     "Edge A",
+		PublicAddr: "203.0.113.10",
+		BindPort:   7000,
+		Region:     "cn-east",
+	})
+	if err != nil {
+		t.Fatalf("join node: %v", err)
+	}
+	if joined.Node.ID != "edge-a" {
+		t.Fatalf("node id sanitized incorrectly: %q", joined.Node.ID)
+	}
+	if joined.NodeToken == "" {
+		t.Fatal("node token is empty")
+	}
+	if _, err := store.JoinNode(JoinRequest{Token: token.Token, NodeID: "edge-b", PublicAddr: "203.0.113.11"}); err != ErrTokenUsed {
+		t.Fatalf("reusing exhausted token error = %v, want %v", err, ErrTokenUsed)
+	}
+	if _, err := store.LeaveNode(joined.Node.ID, "bad-token"); err != ErrNodeTokenMismatch {
+		t.Fatalf("leave with bad token error = %v, want %v", err, ErrNodeTokenMismatch)
+	}
+	left, err := store.LeaveNode(joined.Node.ID, joined.NodeToken)
+	if err != nil {
+		t.Fatalf("leave node: %v", err)
+	}
+	if left.Status != NodeStatusOffline {
+		t.Fatalf("left status = %s, want offline", left.Status)
+	}
+}
+
+func TestHeartbeatRefreshesExpiredNode(t *testing.T) {
+	store := NewMemoryStore()
+	joined := joinTestNode(t, store, "edge-a", "203.0.113.10")
+	store.mu.Lock()
+	store.state.Nodes["edge-a"].LastSeenAt = time.Now().UTC().Add(-2 * time.Minute)
+	store.mu.Unlock()
+	if got := store.Snapshot().Summary.OnlineNodes; got != 0 {
+		t.Fatalf("online nodes before heartbeat = %d, want 0", got)
+	}
+	if _, err := store.HeartbeatNode("edge-a", joined.NodeToken); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	if got := store.Snapshot().Summary.OnlineNodes; got != 1 {
+		t.Fatalf("online nodes after heartbeat = %d, want 1", got)
+	}
+}
+
+func TestSnapshotRedactsNodeToken(t *testing.T) {
+	store := NewMemoryStore()
+	joined := joinTestNode(t, store, "edge-a", "203.0.113.10")
+	if joined.NodeToken == "" {
+		t.Fatal("join did not return node token")
+	}
+	snapshot := store.Snapshot()
+	if snapshot.Nodes[0].NodeToken != "" {
+		t.Fatalf("snapshot leaked node token %q", snapshot.Nodes[0].NodeToken)
+	}
+}
+
+func TestJoinStoresNodeControlURLAndPeers(t *testing.T) {
+	store := NewMemoryStore()
+	if err := store.ConfigureControlPlane("http://edge-a:8080/", []string{"http://edge-b:8080/"}); err != nil {
+		t.Fatalf("configure control plane: %v", err)
+	}
+	token, err := store.CreateJoinToken(time.Hour, 1)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+	joined, err := store.JoinNode(JoinRequest{
+		Token:      token.Token,
+		NodeID:     "edge-c",
+		PublicAddr: "203.0.113.12",
+		ControlURL: "http://edge-c:8080/",
+	})
+	if err != nil {
+		t.Fatalf("join node: %v", err)
+	}
+	if joined.Node.ControlURL != "http://edge-c:8080" {
+		t.Fatalf("control url = %q, want normalized edge-c URL", joined.Node.ControlURL)
+	}
+	peers := strings.Join(store.PeerURLs(), ",")
+	if !strings.Contains(peers, "http://edge-b:8080") || !strings.Contains(peers, "http://edge-c:8080") || strings.Contains(peers, "http://edge-a:8080") {
+		t.Fatalf("peers = %q, want edge-b and edge-c only", peers)
+	}
+}
+
+func TestMergeStatePropagatesNodeLeaveAndTokenExhaustion(t *testing.T) {
+	left := NewMemoryStore()
+	right := NewMemoryStore()
+	token, err := left.CreateJoinToken(time.Hour, 1)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+	if err := right.MergeState(left.RawState(), "http://left:8080"); err != nil {
+		t.Fatalf("merge token to right: %v", err)
+	}
+	joined, err := left.JoinNode(JoinRequest{
+		Token:      token.Token,
+		NodeID:     "edge-a",
+		PublicAddr: "203.0.113.10",
+		ControlURL: "http://edge-a:8080",
+	})
+	if err != nil {
+		t.Fatalf("join node: %v", err)
+	}
+	if _, err := left.AdminLeaveNode(joined.Node.ID); err != nil {
+		t.Fatalf("admin leave: %v", err)
+	}
+	if err := right.MergeState(left.RawState(), "http://left:8080"); err != nil {
+		t.Fatalf("merge left to right: %v", err)
+	}
+	snapshot := right.Snapshot()
+	if len(snapshot.Nodes) != 1 || snapshot.Nodes[0].Status != NodeStatusOffline {
+		t.Fatalf("merged node = %+v, want offline edge-a", snapshot.Nodes)
+	}
+	if _, err := right.JoinNode(JoinRequest{Token: token.Token, NodeID: "edge-b", PublicAddr: "203.0.113.11"}); err != ErrTokenUsed {
+		t.Fatalf("merged exhausted token error = %v, want %v", err, ErrTokenUsed)
+	}
+}
+
+func TestSchedulerPicksLeastLoadedOnlineNode(t *testing.T) {
+	store := NewMemoryStore()
+	nodeA := joinTestNode(t, store, "edge-a", "203.0.113.10")
+	nodeB := joinTestNode(t, store, "edge-b", "203.0.113.11")
+	if err := store.ApplyPluginEvent(nodeA.Node.ID, PluginEvent{Op: "Login", ClientID: "client-a"}); err != nil {
+		t.Fatalf("apply event: %v", err)
+	}
+	if _, err := store.HeartbeatNode(nodeB.Node.ID, nodeB.NodeToken); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	selected, err := store.SelectNodes(ConfigModeSingle, 0)
+	if err != nil {
+		t.Fatalf("select nodes: %v", err)
+	}
+	if len(selected) != 1 || selected[0].ID != "edge-b" {
+		t.Fatalf("selected = %+v, want edge-b", selected)
+	}
+}
+
+func TestHeartbeatStoresNetworkMetrics(t *testing.T) {
+	store := NewMemoryStore()
+	joined := joinTestNode(t, store, "edge-a", "203.0.113.10")
+	node, err := store.HeartbeatNode(joined.Node.ID, joined.NodeToken, NetworkStatus{
+		LatencyMS:            25,
+		DownloadBandwidthBps: 120_000_000,
+		UploadBandwidthBps:   80_000_000,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	if node.Network.LatencyMS != 25 || node.Network.BandwidthBps != 80_000_000 {
+		t.Fatalf("network = %+v, want latency and effective bandwidth", node.Network)
+	}
+	if node.Network.Score <= 50 {
+		t.Fatalf("network score = %d, want better than neutral", node.Network.Score)
+	}
+	snapshot := store.Snapshot()
+	if snapshot.Nodes[0].Network.LatencyMS != 25 || snapshot.Nodes[0].Network.Score == 0 {
+		t.Fatalf("snapshot network = %+v", snapshot.Nodes[0].Network)
+	}
+}
+
+func TestSchedulerPrefersBetterNetworkBeforeLoad(t *testing.T) {
+	store := NewMemoryStore()
+	nodeA := joinTestNode(t, store, "edge-a", "203.0.113.10")
+	nodeB := joinTestNode(t, store, "edge-b", "203.0.113.11")
+	if err := store.ApplyPluginEvent(nodeA.Node.ID, PluginEvent{Op: "Login", ClientID: "client-a"}); err != nil {
+		t.Fatalf("apply event: %v", err)
+	}
+	if _, err := store.HeartbeatNode(nodeA.Node.ID, nodeA.NodeToken, NetworkStatus{LatencyMS: 20, DownloadBandwidthBps: 500_000_000, UploadBandwidthBps: 500_000_000}); err != nil {
+		t.Fatalf("heartbeat edge-a: %v", err)
+	}
+	if _, err := store.HeartbeatNode(nodeB.Node.ID, nodeB.NodeToken, NetworkStatus{LatencyMS: 300, DownloadBandwidthBps: 5_000_000, UploadBandwidthBps: 5_000_000}); err != nil {
+		t.Fatalf("heartbeat edge-b: %v", err)
+	}
+	selected, err := store.SelectNodes(ConfigModeSingle, 0)
+	if err != nil {
+		t.Fatalf("select nodes: %v", err)
+	}
+	if len(selected) != 1 || selected[0].ID != "edge-a" {
+		t.Fatalf("selected = %+v, want edge-a by network quality", selected)
+	}
+}
+
+func TestGenerateFrpcSingleConfigUsesBestNetworkNode(t *testing.T) {
+	store := NewMemoryStore()
+	nodeA := joinTestNode(t, store, "edge-a", "203.0.113.10")
+	nodeB := joinTestNode(t, store, "edge-b", "203.0.113.11")
+	if _, err := store.HeartbeatNode(nodeA.Node.ID, nodeA.NodeToken, NetworkStatus{LatencyMS: 300, DownloadBandwidthBps: 5_000_000, UploadBandwidthBps: 5_000_000}); err != nil {
+		t.Fatalf("heartbeat edge-a: %v", err)
+	}
+	if _, err := store.HeartbeatNode(nodeB.Node.ID, nodeB.NodeToken, NetworkStatus{LatencyMS: 15, DownloadBandwidthBps: 500_000_000, UploadBandwidthBps: 500_000_000}); err != nil {
+		t.Fatalf("heartbeat edge-b: %v", err)
+	}
+	config, err := store.GenerateFrpcConfig(FrpcConfigOptions{ClientID: "app-1", Mode: ConfigModeSingle})
+	if err != nil {
+		t.Fatalf("generate frpc: %v", err)
+	}
+	if !strings.Contains(config, `serverAddr = "203.0.113.11"`) {
+		t.Fatalf("single config did not use best network node:\n%s", config)
+	}
+	if strings.Contains(config, `serverAddr = "203.0.113.10"`) {
+		t.Fatalf("single config included worse node:\n%s", config)
+	}
+}
+
+func TestGenerateFrpcFailoverSticksToCurrentClientNodeUntilManualSwitch(t *testing.T) {
+	store := NewMemoryStore()
+	nodeA := joinTestNode(t, store, "edge-a", "203.0.113.10")
+	nodeB := joinTestNode(t, store, "edge-b", "203.0.113.11")
+	if _, err := store.HeartbeatNode(nodeA.Node.ID, nodeA.NodeToken, NetworkStatus{LatencyMS: 300, DownloadBandwidthBps: 5_000_000, UploadBandwidthBps: 5_000_000}); err != nil {
+		t.Fatalf("heartbeat edge-a: %v", err)
+	}
+	if _, err := store.HeartbeatNode(nodeB.Node.ID, nodeB.NodeToken, NetworkStatus{LatencyMS: 15, DownloadBandwidthBps: 500_000_000, UploadBandwidthBps: 500_000_000}); err != nil {
+		t.Fatalf("heartbeat edge-b: %v", err)
+	}
+	if err := store.ApplyPluginEvent(nodeA.Node.ID, PluginEvent{Op: "Login", ClientID: "app-1"}); err != nil {
+		t.Fatalf("apply plugin login: %v", err)
+	}
+	files, err := store.GenerateFrpcConfigFiles(FrpcConfigOptions{
+		ClientID: "app-1",
+		Mode:     ConfigModeFailover,
+		Limit:    1,
+	})
+	if err != nil {
+		t.Fatalf("generate files before manual switch: %v", err)
+	}
+	if _, ok := files["frpc-app-1-edge-a.toml"]; !ok {
+		t.Fatalf("client did not stick to current node edge-a: %#v", files)
+	}
+	if _, ok := files["frpc-app-1-edge-b.toml"]; ok {
+		t.Fatalf("client switched to better node without manual target: %#v", files)
+	}
+	if _, err := store.SetClientTarget("app-1", nodeB.Node.ID); err != nil {
+		t.Fatalf("set manual target: %v", err)
+	}
+	files, err = store.GenerateFrpcConfigFiles(FrpcConfigOptions{
+		ClientID: "app-1",
+		Mode:     ConfigModeFailover,
+		Limit:    1,
+	})
+	if err != nil {
+		t.Fatalf("generate files after manual switch: %v", err)
+	}
+	if _, ok := files["frpc-app-1-edge-b.toml"]; !ok {
+		t.Fatalf("client did not switch to manual target edge-b: %#v", files)
+	}
+	if _, ok := files["frpc-app-1-edge-a.toml"]; ok {
+		t.Fatalf("client kept old node after manual switch: %#v", files)
+	}
+}
+
+func TestMigrationRecommendationTargetsBetterNetworkNode(t *testing.T) {
+	store := NewMemoryStore()
+	nodeA := joinTestNode(t, store, "edge-a", "203.0.113.10")
+	nodeB := joinTestNode(t, store, "edge-b", "203.0.113.11")
+	if _, err := store.HeartbeatNode(nodeA.Node.ID, nodeA.NodeToken, NetworkStatus{LatencyMS: 250, DownloadBandwidthBps: 5_000_000, UploadBandwidthBps: 5_000_000}); err != nil {
+		t.Fatalf("heartbeat edge-a: %v", err)
+	}
+	if _, err := store.HeartbeatNode(nodeB.Node.ID, nodeB.NodeToken, NetworkStatus{LatencyMS: 20, DownloadBandwidthBps: 200_000_000, UploadBandwidthBps: 200_000_000}); err != nil {
+		t.Fatalf("heartbeat edge-b: %v", err)
+	}
+	if err := store.ApplyPluginEvent(nodeA.Node.ID, PluginEvent{Op: "Login", ClientID: "app-1"}); err != nil {
+		t.Fatalf("apply event: %v", err)
+	}
+	snapshot := store.Snapshot()
+	if snapshot.Clients[0].PreferredNodeID != "edge-b" || snapshot.Clients[0].MigrationState != MigrationStatePending {
+		t.Fatalf("client migration = %+v, want pending edge-b", snapshot.Clients[0])
+	}
+	foundEvent := false
+	for _, event := range snapshot.Events {
+		if event.Type == "client.migration_recommended" && event.ClientID == "app-1" {
+			foundEvent = true
+			break
+		}
+	}
+	if !foundEvent {
+		t.Fatalf("migration event not found: %+v", snapshot.Events)
+	}
+}
+
+func TestGenerateFrpcAggregateConfig(t *testing.T) {
+	store := NewMemoryStore()
+	joinTestNode(t, store, "edge-a", "203.0.113.10")
+	joinTestNode(t, store, "edge-b", "203.0.113.11")
+	config, err := store.GenerateFrpcConfig(FrpcConfigOptions{ClientID: "app-1", Mode: ConfigModeAggregate})
+	if err != nil {
+		t.Fatalf("generate frpc: %v", err)
+	}
+	for _, want := range []string{`serverAddr = "203.0.113.10"`, `serverAddr = "203.0.113.11"`, `app-1-health-edge-a`, `app-1-health-edge-b`} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("config missing %q:\n%s", want, config)
+		}
+	}
+}
+
+func TestGenerateFrpcBusinessProxyConfig(t *testing.T) {
+	store := NewMemoryStore()
+	joinTestNode(t, store, "edge-a", "203.0.113.10")
+	joinTestNode(t, store, "edge-b", "203.0.113.11")
+	spec, err := ParseProxySpec("web:tcp:127.0.0.1:8080:18080")
+	if err != nil {
+		t.Fatalf("parse proxy: %v", err)
+	}
+	files, err := store.GenerateFrpcConfigFiles(FrpcConfigOptions{
+		ClientID: "app-1",
+		Mode:     ConfigModeAggregate,
+		Proxies:  []ProxySpec{spec},
+	})
+	if err != nil {
+		t.Fatalf("generate files: %v", err)
+	}
+	for name, content := range files {
+		for _, want := range []string{`name = "web"`, `localPort = 8080`, `remotePort = 18080`} {
+			if !strings.Contains(content, want) {
+				t.Fatalf("%s missing %q:\n%s", name, want, content)
+			}
+		}
+		if strings.Contains(content, "health") {
+			t.Fatalf("%s contains default health proxy when business proxy was provided:\n%s", name, content)
+		}
+	}
+}
+
+func TestGenerateFrpcFailoverConfigFilesHonorsLimit(t *testing.T) {
+	store := NewMemoryStore()
+	joinTestNode(t, store, "edge-a", "203.0.113.10")
+	joinTestNode(t, store, "edge-b", "203.0.113.11")
+	joinTestNode(t, store, "edge-c", "203.0.113.12")
+	files, err := store.GenerateFrpcConfigFiles(FrpcConfigOptions{
+		ClientID: "app-1",
+		Mode:     ConfigModeFailover,
+		Limit:    2,
+	})
+	if err != nil {
+		t.Fatalf("generate failover files: %v", err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("files = %d, want 2", len(files))
+	}
+	if _, ok := files["frpc-app-1-edge-c.toml"]; ok {
+		t.Fatalf("failover limit was not honored: %#v", files)
+	}
+}
+
+func TestPluginEventsUpdateClientAndProxy(t *testing.T) {
+	store := NewMemoryStore()
+	joinTestNode(t, store, "edge-a", "203.0.113.10")
+	if err := store.ApplyPluginEvent("edge-a", PluginEvent{
+		Op:         "NewProxy",
+		ClientID:   "app-1",
+		User:       "app-user",
+		ProxyName:  "ssh",
+		ProxyType:  "tcp",
+		RemotePort: 22001,
+	}); err != nil {
+		t.Fatalf("apply plugin event: %v", err)
+	}
+	snapshot := store.Snapshot()
+	if snapshot.Summary.OnlineClients != 1 || snapshot.Summary.OnlineProxies != 1 {
+		t.Fatalf("summary = %+v, want one online client and proxy", snapshot.Summary)
+	}
+	if snapshot.Clients[0].ProxyCount != 1 {
+		t.Fatalf("client proxy count = %d, want 1", snapshot.Clients[0].ProxyCount)
+	}
+	if err := store.ApplyPluginEvent("edge-a", PluginEvent{Op: "CloseProxy", ClientID: "app-1", ProxyName: "ssh"}); err != nil {
+		t.Fatalf("close proxy: %v", err)
+	}
+	if got := store.Snapshot().Summary.OnlineProxies; got != 0 {
+		t.Fatalf("online proxies = %d, want 0", got)
+	}
+}
+
+func TestSnapshotMarksClientsOfflineWhenNodeExpires(t *testing.T) {
+	store := NewMemoryStore()
+	joinTestNode(t, store, "edge-a", "203.0.113.10")
+	if err := store.ApplyPluginEvent("edge-a", PluginEvent{Op: "NewProxy", ClientID: "app-1", ProxyName: "ssh"}); err != nil {
+		t.Fatalf("apply plugin event: %v", err)
+	}
+	store.mu.Lock()
+	store.state.Nodes["edge-a"].LastSeenAt = time.Now().UTC().Add(-2 * time.Minute)
+	store.mu.Unlock()
+
+	snapshot := store.Snapshot()
+	if snapshot.Summary.OnlineNodes != 0 || snapshot.Summary.OnlineClients != 0 || snapshot.Summary.OnlineProxies != 0 {
+		t.Fatalf("summary = %+v, want all online counts zero", snapshot.Summary)
+	}
+	if snapshot.Clients[0].Status != ClientStatusOffline {
+		t.Fatalf("client status = %s, want offline", snapshot.Clients[0].Status)
+	}
+	if snapshot.Proxies[0].Status != ProxyStatusClosed {
+		t.Fatalf("proxy status = %s, want closed", snapshot.Proxies[0].Status)
+	}
+}
+
+func TestAPIJoinAndConfig(t *testing.T) {
+	store := NewMemoryStore()
+	server := httptest.NewServer(NewAPI(store).Handler())
+	defer server.Close()
+
+	var token JoinToken
+	postTestJSON(t, server.URL+"/api/v1/tokens", map[string]any{"ttl": "1h", "uses": 1}, &token)
+	var joined JoinResponse
+	postTestJSON(t, server.URL+"/api/v1/nodes/join", JoinRequest{Token: token.Token, NodeID: "edge-a", PublicAddr: "203.0.113.10"}, &joined)
+
+	resp, err := http.Get(server.URL + "/api/v1/config/frps?node_id=edge-a")
+	if err != nil {
+		t.Fatalf("get frps config: %v", err)
+	}
+	defer resp.Body.Close()
+	buf := new(bytes.Buffer)
+	_, _ = buf.ReadFrom(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("frps config status=%d body=%s", resp.StatusCode, buf.String())
+	}
+	if !strings.Contains(buf.String(), `bindPort = 7000`) || !strings.Contains(buf.String(), `/api/v1/frp/plugin/edge-a`) {
+		t.Fatalf("unexpected frps config:\n%s", buf.String())
+	}
+}
+
+func TestAPIAdminLeaveAndPeerState(t *testing.T) {
+	store := NewMemoryStore()
+	server := httptest.NewServer(NewAPI(store).Handler())
+	defer server.Close()
+
+	var token JoinToken
+	postTestJSON(t, server.URL+"/api/v1/tokens", map[string]any{"ttl": "1h", "uses": 1}, &token)
+	var joined JoinResponse
+	postTestJSON(t, server.URL+"/api/v1/nodes/join", JoinRequest{
+		Token:      token.Token,
+		NodeID:     "edge-a",
+		PublicAddr: "203.0.113.10",
+		ControlURL: server.URL,
+	}, &joined)
+
+	resp, err := http.Post(server.URL+"/api/v1/nodes/edge-a/admin-leave", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("admin leave: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("admin leave status = %d", resp.StatusCode)
+	}
+
+	peerResp, err := http.Get(server.URL + "/api/v1/peer/state")
+	if err != nil {
+		t.Fatalf("get peer state: %v", err)
+	}
+	defer peerResp.Body.Close()
+	if peerResp.StatusCode != http.StatusOK {
+		t.Fatalf("peer state status = %d", peerResp.StatusCode)
+	}
+	var state ClusterState
+	if err := json.NewDecoder(peerResp.Body).Decode(&state); err != nil {
+		t.Fatalf("decode peer state: %v", err)
+	}
+	if state.Nodes["edge-a"] == nil || state.Nodes["edge-a"].Status != NodeStatusOffline {
+		t.Fatalf("peer state node = %+v, want offline edge-a", state.Nodes["edge-a"])
+	}
+}
+
+func TestAPIHeartbeatAcceptsNetworkMetrics(t *testing.T) {
+	store := NewMemoryStore()
+	server := httptest.NewServer(NewAPI(store).Handler())
+	defer server.Close()
+
+	var token JoinToken
+	postTestJSON(t, server.URL+"/api/v1/tokens", map[string]any{"ttl": "1h", "uses": 1}, &token)
+	var joined JoinResponse
+	postTestJSON(t, server.URL+"/api/v1/nodes/join", JoinRequest{Token: token.Token, NodeID: "edge-a", PublicAddr: "203.0.113.10"}, &joined)
+
+	var node ServerNode
+	postTestJSON(t, server.URL+"/api/v1/nodes/edge-a/heartbeat", HeartbeatRequest{
+		NodeToken: joined.NodeToken,
+		Network: NetworkStatus{
+			LatencyMS:            35,
+			DownloadBandwidthBps: 90_000_000,
+			UploadBandwidthBps:   60_000_000,
+			ObservedRxBps:        10_000_000,
+			ObservedTxBps:        8_000_000,
+		},
+	}, &node)
+	if node.Network.LatencyMS != 35 || node.Network.BandwidthBps != 60_000_000 || node.Network.Score == 0 {
+		t.Fatalf("node network = %+v", node.Network)
+	}
+}
+
+func TestAPINetworkProbe(t *testing.T) {
+	store := NewMemoryStore()
+	server := httptest.NewServer(NewAPI(store).Handler())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/api/v1/network/probe?size=4096")
+	if err != nil {
+		t.Fatalf("get probe: %v", err)
+	}
+	data, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || len(data) != 4096 {
+		t.Fatalf("probe get status=%d bytes=%d", resp.StatusCode, len(data))
+	}
+
+	uploadResp, err := http.Post(server.URL+"/api/v1/network/probe", "application/octet-stream", bytes.NewReader(bytes.Repeat([]byte("x"), 2048)))
+	if err != nil {
+		t.Fatalf("post probe: %v", err)
+	}
+	defer uploadResp.Body.Close()
+	var payload struct {
+		Bytes int64 `json:"bytes"`
+	}
+	if err := json.NewDecoder(uploadResp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode probe: %v", err)
+	}
+	if payload.Bytes != 2048 {
+		t.Fatalf("probe post bytes = %d, want 2048", payload.Bytes)
+	}
+}
+
+func TestAPIFrpcConfigFiles(t *testing.T) {
+	store := NewMemoryStore()
+	server := httptest.NewServer(NewAPI(store).Handler())
+	defer server.Close()
+
+	token, err := store.CreateJoinToken(time.Hour, 2)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+	postTestJSON(t, server.URL+"/api/v1/nodes/join", JoinRequest{Token: token.Token, NodeID: "edge-a", PublicAddr: "203.0.113.10"}, &JoinResponse{})
+	postTestJSON(t, server.URL+"/api/v1/nodes/join", JoinRequest{Token: token.Token, NodeID: "edge-b", PublicAddr: "203.0.113.11"}, &JoinResponse{})
+
+	var payload struct {
+		Files map[string]string `json:"files"`
+	}
+	resp, err := http.Get(server.URL + "/api/v1/config/frpc?client_id=app-1&mode=aggregate&format=json&proxy=web:tcp:127.0.0.1:8080:18080")
+	if err != nil {
+		t.Fatalf("get frpc config files: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(payload.Files) != 2 {
+		t.Fatalf("files = %d, want 2", len(payload.Files))
+	}
+	if !strings.Contains(payload.Files["frpc-app-1-edge-a.toml"], `serverAddr = "203.0.113.10"`) {
+		t.Fatalf("edge-a config missing server address: %#v", payload.Files)
+	}
+	if !strings.Contains(payload.Files["frpc-app-1-edge-a.toml"], `name = "web"`) {
+		t.Fatalf("edge-a config missing business proxy: %#v", payload.Files)
+	}
+}
+
+func joinTestNode(t *testing.T, store *Store, nodeID, publicAddr string) *JoinResponse {
+	t.Helper()
+	token, err := store.CreateJoinToken(time.Hour, 1)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+	resp, err := store.JoinNode(JoinRequest{Token: token.Token, NodeID: nodeID, PublicAddr: publicAddr, BindPort: 7000})
+	if err != nil {
+		t.Fatalf("join %s: %v", nodeID, err)
+	}
+	return resp
+}
+
+func postTestJSON(t *testing.T, url string, value any, target any) {
+	t.Helper()
+	body, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		buf := new(bytes.Buffer)
+		_, _ = buf.ReadFrom(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, buf.String())
+	}
+	if err := json.NewDecoder(resp.Body).Decode(target); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+}

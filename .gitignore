@@ -1,0 +1,5 @@
+/bin/
+/tmp/
+/output/
+/data/
+*.log
