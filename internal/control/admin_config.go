@@ -18,8 +18,9 @@ type AliDNSSettings struct {
 }
 
 type AgentSettings struct {
-	Interval  string `json:"interval"`
-	ProbeSize string `json:"probe_size"`
+	Interval         string `json:"interval"`
+	ProbeSize        string `json:"probe_size"`
+	FrpsDashboardURL string `json:"frps_dashboard_url"`
 }
 
 func ReadAliDNSSettings(path string) (AliDNSSettings, error) {
@@ -78,13 +79,14 @@ func ReadAgentSettings(path string) (AgentSettings, error) {
 	values, err := ReadEnvFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return AgentSettings{Interval: "30s", ProbeSize: "262144"}, nil
+			return AgentSettings{Interval: "30s", ProbeSize: "262144", FrpsDashboardURL: "http://127.0.0.1:7500"}, nil
 		}
 		return AgentSettings{}, err
 	}
 	return AgentSettings{
-		Interval:  firstNonEmpty(values["AGENT_INTERVAL"], "30s"),
-		ProbeSize: firstNonEmpty(values["PROBE_SIZE"], "262144"),
+		Interval:         firstNonEmpty(values["AGENT_INTERVAL"], "30s"),
+		ProbeSize:        firstNonEmpty(values["PROBE_SIZE"], "262144"),
+		FrpsDashboardURL: firstNonEmpty(values["FRPS_DASHBOARD_URL"], "http://127.0.0.1:7500"),
 	}, nil
 }
 
@@ -95,5 +97,6 @@ func WriteAgentSettings(path string, settings AgentSettings) error {
 	}
 	values["AGENT_INTERVAL"] = firstNonEmpty(settings.Interval, "30s")
 	values["PROBE_SIZE"] = firstNonEmpty(settings.ProbeSize, "262144")
+	values["FRPS_DASHBOARD_URL"] = firstNonEmpty(settings.FrpsDashboardURL, "http://127.0.0.1:7500")
 	return WriteEnvFile(path, values, 0o600)
 }

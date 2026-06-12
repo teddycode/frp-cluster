@@ -51,12 +51,13 @@ func defaultState() ClusterState {
 			AutoMigration:     &autoMigration,
 			MigrationScoreGap: 15,
 		},
-		Nodes:         map[string]*ServerNode{},
-		Clients:       map[string]*Client{},
-		Proxies:       map[string]*Proxy{},
-		Tokens:        map[string]*JoinToken{},
-		Events:        []Event{},
-		SwitchMetrics: map[string]*MonthlySwitch{},
+		Nodes:          map[string]*ServerNode{},
+		Clients:        map[string]*Client{},
+		Proxies:        map[string]*Proxy{},
+		Tokens:         map[string]*JoinToken{},
+		Events:         []Event{},
+		SwitchMetrics:  map[string]*MonthlySwitch{},
+		TrafficSamples: []TrafficSample{},
 	}
 }
 
@@ -100,6 +101,9 @@ func (s *Store) ensureMaps() {
 	}
 	if s.state.SwitchMetrics == nil {
 		s.state.SwitchMetrics = map[string]*MonthlySwitch{}
+	}
+	if s.state.TrafficSamples == nil {
+		s.state.TrafficSamples = []TrafficSample{}
 	}
 	if s.state.Config.Name == "" {
 		s.state.Config.Name = "frp-cluster"
@@ -432,6 +436,7 @@ func (s *Store) MergeState(remote ClusterState, sourceURL string) error {
 	if len(s.state.Events) > 500 {
 		s.state.Events = s.state.Events[len(s.state.Events)-500:]
 	}
+	s.state.TrafficSamples = mergeTrafficSamples(s.state.TrafficSamples, remote.TrafficSamples, now)
 	s.recomputeNodeCountsLocked()
 	return s.saveLocked()
 }
@@ -487,6 +492,12 @@ func normalizeClusterState(state ClusterState) ClusterState {
 	}
 	if state.Events == nil {
 		state.Events = []Event{}
+	}
+	if state.SwitchMetrics == nil {
+		state.SwitchMetrics = map[string]*MonthlySwitch{}
+	}
+	if state.TrafficSamples == nil {
+		state.TrafficSamples = []TrafficSample{}
 	}
 	if state.Config.Name == "" {
 		state.Config.Name = "frp-cluster"

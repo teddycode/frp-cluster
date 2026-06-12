@@ -111,6 +111,7 @@ func (s *Store) HeartbeatNodeWithRequest(nodeID string, req HeartbeatRequest) (*
 	if network, ok := normalizeHeartbeatNetwork(req, node.Network, now); ok {
 		node.Network = network
 	}
+	s.recordTrafficLocked(nodeID, req.Traffic, now)
 	s.recomputeNodeCountsLocked()
 	s.applyMigrationRecommendationsLocked(now)
 	s.addEventLocked("node.heartbeat", fmt.Sprintf("node %s heartbeat", nodeID), nodeID, "", "", networkEventMetadata(node.Network), now)

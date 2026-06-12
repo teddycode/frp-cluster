@@ -80,6 +80,74 @@ body {
   font-size: 12px;
 }
 
+.traffic-chart-wrap {
+  margin-top: 16px;
+}
+
+.traffic-chart {
+  width: 100%;
+  height: 260px;
+  display: block;
+}
+
+.chart-axis {
+  stroke: #94a3b8;
+  stroke-width: 1;
+}
+
+.chart-grid {
+  stroke: #e5e7eb;
+  stroke-width: 1;
+}
+
+.chart-line {
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.chart-line-total {
+  stroke: #0f172a;
+  stroke-width: 3;
+}
+
+.chart-label {
+  fill: #64748b;
+  font-size: 12px;
+}
+
+.traffic-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  color: #475569;
+  font-size: 13px;
+}
+
+.legend-dot {
+  width: 9px;
+  height: 9px;
+  display: inline-block;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+
+.legend-dot.total {
+  background: #0f172a;
+}
+
+.empty-chart {
+  margin-top: 16px;
+  height: 180px;
+  display: grid;
+  place-items: center;
+  border: 1px dashed #cbd5e1;
+  border-radius: 6px;
+  color: #64748b;
+  background: #f8fafc;
+}
+
 .command-card pre {
   margin: 12px 0 0;
   padding: 14px;

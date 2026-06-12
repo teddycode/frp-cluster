@@ -700,13 +700,13 @@ func TestAPIAdminConfigUpdatesAliDNSAndAgentSettings(t *testing.T) {
 	dir := t.TempDir()
 	aliPath := filepath.Join(dir, "alidns.env")
 	nodeEnvPath := filepath.Join(dir, "node.env")
-	if err := os.WriteFile(nodeEnvPath, []byte("NODE_ID=edge-a\nPROBE_SIZE=262144\nAGENT_INTERVAL=30s\n"), 0o600); err != nil {
+	if err := os.WriteFile(nodeEnvPath, []byte("NODE_ID=edge-a\nPROBE_SIZE=262144\nAGENT_INTERVAL=30s\nFRPS_DASHBOARD_URL=http://127.0.0.1:7500\n"), 0o600); err != nil {
 		t.Fatalf("write node env: %v", err)
 	}
 	server := httptest.NewServer(NewAPIWithOptions(store, RuntimeOptions{AliDNSConfigFile: aliPath, NodeEnvFile: nodeEnvPath}).Handler())
 	defer server.Close()
 
-	req, err := http.NewRequest(http.MethodPatch, server.URL+"/api/v1/admin/config", strings.NewReader(`{"alidns":{"access_key_id":"kid","access_key_secret":"secret","domain_name":"buaadcl.tech","ttl":"600"},"agent":{"interval":"15s","probe_size":"131072"}}`))
+	req, err := http.NewRequest(http.MethodPatch, server.URL+"/api/v1/admin/config", strings.NewReader(`{"alidns":{"access_key_id":"kid","access_key_secret":"secret","domain_name":"buaadcl.tech","ttl":"600"},"agent":{"interval":"15s","probe_size":"131072","frps_dashboard_url":"http://127.0.0.1:7500"}}`))
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
@@ -730,7 +730,7 @@ func TestAPIAdminConfigUpdatesAliDNSAndAgentSettings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read node env: %v", err)
 	}
-	if nodeValues["AGENT_INTERVAL"] != "15s" || nodeValues["PROBE_SIZE"] != "131072" {
+	if nodeValues["AGENT_INTERVAL"] != "15s" || nodeValues["PROBE_SIZE"] != "131072" || nodeValues["FRPS_DASHBOARD_URL"] != "http://127.0.0.1:7500" {
 		t.Fatalf("node env = %+v", nodeValues)
 	}
 }
@@ -812,6 +812,43 @@ func TestAPIHeartbeatAcceptsNetworkMetrics(t *testing.T) {
 	}, &node)
 	if node.Network.LatencyMS != 35 || node.Network.BandwidthBps != 60_000_000 || node.Network.Score == 0 {
 		t.Fatalf("node network = %+v", node.Network)
+	}
+}
+
+func TestAPIHeartbeatStoresTrafficSamples(t *testing.T) {
+	store := NewMemoryStore()
+	server := httptest.NewServer(NewAPI(store).Handler())
+	defer server.Close()
+
+	var token JoinToken
+	postTestJSON(t, server.URL+"/api/v1/tokens", map[string]any{"ttl": "1h", "uses": 1}, &token)
+	var joined JoinResponse
+	postTestJSON(t, server.URL+"/api/v1/nodes/join", JoinRequest{Token: token.Token, NodeID: "edge-a", PublicAddr: "203.0.113.10"}, &joined)
+
+	postTestJSON(t, server.URL+"/api/v1/nodes/edge-a/heartbeat", HeartbeatRequest{
+		NodeToken: joined.NodeToken,
+		Traffic: TrafficCounters{
+			TotalInBytes:       1000,
+			TotalOutBytes:      2000,
+			CurrentConnections: 2,
+			Proxies: []ProxyTraffic{{
+				Name:          "local-ssh.ssh",
+				Type:          "tcp",
+				TotalInBytes:  1000,
+				TotalOutBytes: 2000,
+			}},
+		},
+	}, &ServerNode{})
+
+	series := store.TrafficSeries(time.Hour)
+	if len(series.Samples) != 1 {
+		t.Fatalf("samples = %d, want 1", len(series.Samples))
+	}
+	if series.Samples[0].NodeID != "edge-a" || series.Samples[0].TotalInBytes != 1000 || series.Samples[0].CurrentConnections != 2 {
+		t.Fatalf("sample = %+v", series.Samples[0])
+	}
+	if series.Totals.TotalOutBytes != 2000 || len(series.Nodes) != 1 || series.Nodes[0].NodeID != "edge-a" {
+		t.Fatalf("series = %+v", series)
 	}
 }
 

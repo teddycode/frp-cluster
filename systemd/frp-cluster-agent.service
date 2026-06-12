@@ -7,7 +7,7 @@ Requires=frps.service
 [Service]
 Type=simple
 EnvironmentFile=/etc/frp-cluster/node.env
-ExecStart=/usr/local/bin/frp-cluster agent --control-url ${NODE_CONTROL_URL} --node-id ${NODE_ID} --token ${NODE_TOKEN} --interval ${AGENT_INTERVAL} --probe-size ${PROBE_SIZE}
+ExecStart=/usr/local/bin/frp-cluster agent --control-url ${NODE_CONTROL_URL} --node-id ${NODE_ID} --token ${NODE_TOKEN} --interval ${AGENT_INTERVAL} --probe-size ${PROBE_SIZE} --frps-dashboard-url ${FRPS_DASHBOARD_URL}
 Restart=always
 RestartSec=3
 

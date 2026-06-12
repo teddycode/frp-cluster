@@ -36,23 +36,24 @@ type ClusterConfig struct {
 }
 
 type ServerNode struct {
-	ID             string        `json:"id"`
-	Name           string        `json:"name"`
-	PublicAddr     string        `json:"public_addr"`
-	ControlURL     string        `json:"control_url,omitempty"`
-	BindPort       int           `json:"bind_port"`
-	VhostHTTPPort  int           `json:"vhost_http_port"`
-	VhostHTTPSPort int           `json:"vhost_https_port"`
-	Region         string        `json:"region"`
-	Tags           []string      `json:"tags"`
-	Status         string        `json:"status"`
-	NodeToken      string        `json:"node_token"`
-	ClientCount    int           `json:"client_count"`
-	ProxyCount     int           `json:"proxy_count"`
-	Network        NetworkStatus `json:"network"`
-	JoinedAt       time.Time     `json:"joined_at"`
-	LastSeenAt     time.Time     `json:"last_seen_at"`
-	UpdatedAt      time.Time     `json:"updated_at"`
+	ID             string          `json:"id"`
+	Name           string          `json:"name"`
+	PublicAddr     string          `json:"public_addr"`
+	ControlURL     string          `json:"control_url,omitempty"`
+	BindPort       int             `json:"bind_port"`
+	VhostHTTPPort  int             `json:"vhost_http_port"`
+	VhostHTTPSPort int             `json:"vhost_https_port"`
+	Region         string          `json:"region"`
+	Tags           []string        `json:"tags"`
+	Status         string          `json:"status"`
+	NodeToken      string          `json:"node_token"`
+	ClientCount    int             `json:"client_count"`
+	ProxyCount     int             `json:"proxy_count"`
+	Network        NetworkStatus   `json:"network"`
+	Traffic        TrafficCounters `json:"traffic"`
+	JoinedAt       time.Time       `json:"joined_at"`
+	LastSeenAt     time.Time       `json:"last_seen_at"`
+	UpdatedAt      time.Time       `json:"updated_at"`
 }
 
 type NetworkStatus struct {
@@ -65,6 +66,52 @@ type NetworkStatus struct {
 	Score                int       `json:"score"`
 	MeasuredAt           time.Time `json:"measured_at"`
 	Stale                bool      `json:"stale"`
+}
+
+type TrafficCounters struct {
+	TotalInBytes       int64          `json:"total_in_bytes"`
+	TotalOutBytes      int64          `json:"total_out_bytes"`
+	CurrentConnections int64          `json:"current_connections"`
+	Proxies            []ProxyTraffic `json:"proxies,omitempty"`
+	MeasuredAt         time.Time      `json:"measured_at"`
+}
+
+type ProxyTraffic struct {
+	Name               string `json:"name"`
+	Type               string `json:"type"`
+	ClientID           string `json:"client_id,omitempty"`
+	TotalInBytes       int64  `json:"total_in_bytes"`
+	TotalOutBytes      int64  `json:"total_out_bytes"`
+	CurrentConnections int64  `json:"current_connections"`
+	Status             string `json:"status,omitempty"`
+}
+
+type TrafficSample struct {
+	NodeID             string    `json:"node_id"`
+	At                 time.Time `json:"at"`
+	TotalInBytes       int64     `json:"total_in_bytes"`
+	TotalOutBytes      int64     `json:"total_out_bytes"`
+	DeltaInBytes       int64     `json:"delta_in_bytes"`
+	DeltaOutBytes      int64     `json:"delta_out_bytes"`
+	CurrentConnections int64     `json:"current_connections"`
+}
+
+type TrafficSeries struct {
+	Samples []TrafficSample `json:"samples"`
+	Totals  TrafficTotals   `json:"totals"`
+	Nodes   []NodeTraffic   `json:"nodes"`
+}
+
+type TrafficTotals struct {
+	TotalInBytes  int64 `json:"total_in_bytes"`
+	TotalOutBytes int64 `json:"total_out_bytes"`
+	DeltaInBytes  int64 `json:"delta_in_bytes"`
+	DeltaOutBytes int64 `json:"delta_out_bytes"`
+}
+
+type NodeTraffic struct {
+	NodeID string        `json:"node_id"`
+	Totals TrafficTotals `json:"totals"`
 }
 
 type Client struct {
@@ -116,13 +163,14 @@ type Event struct {
 }
 
 type ClusterState struct {
-	Config        ClusterConfig             `json:"config"`
-	Nodes         map[string]*ServerNode    `json:"nodes"`
-	Clients       map[string]*Client        `json:"clients"`
-	Proxies       map[string]*Proxy         `json:"proxies"`
-	Tokens        map[string]*JoinToken     `json:"tokens"`
-	Events        []Event                   `json:"events"`
-	SwitchMetrics map[string]*MonthlySwitch `json:"switch_metrics,omitempty"`
+	Config         ClusterConfig             `json:"config"`
+	Nodes          map[string]*ServerNode    `json:"nodes"`
+	Clients        map[string]*Client        `json:"clients"`
+	Proxies        map[string]*Proxy         `json:"proxies"`
+	Tokens         map[string]*JoinToken     `json:"tokens"`
+	Events         []Event                   `json:"events"`
+	SwitchMetrics  map[string]*MonthlySwitch `json:"switch_metrics,omitempty"`
+	TrafficSamples []TrafficSample           `json:"traffic_samples,omitempty"`
 }
 
 type JoinRequest struct {
@@ -139,14 +187,15 @@ type JoinRequest struct {
 }
 
 type HeartbeatRequest struct {
-	NodeToken            string        `json:"node_token"`
-	Network              NetworkStatus `json:"network"`
-	LatencyMS            int64         `json:"latency_ms,omitempty"`
-	DownloadBandwidthBps int64         `json:"download_bandwidth_bps,omitempty"`
-	UploadBandwidthBps   int64         `json:"upload_bandwidth_bps,omitempty"`
-	ObservedRxBps        int64         `json:"observed_rx_bps,omitempty"`
-	ObservedTxBps        int64         `json:"observed_tx_bps,omitempty"`
-	BandwidthBps         int64         `json:"bandwidth_bps,omitempty"`
+	NodeToken            string          `json:"node_token"`
+	Network              NetworkStatus   `json:"network"`
+	Traffic              TrafficCounters `json:"traffic"`
+	LatencyMS            int64           `json:"latency_ms,omitempty"`
+	DownloadBandwidthBps int64           `json:"download_bandwidth_bps,omitempty"`
+	UploadBandwidthBps   int64           `json:"upload_bandwidth_bps,omitempty"`
+	ObservedRxBps        int64           `json:"observed_rx_bps,omitempty"`
+	ObservedTxBps        int64           `json:"observed_tx_bps,omitempty"`
+	BandwidthBps         int64           `json:"bandwidth_bps,omitempty"`
 }
 
 type JoinResponse struct {

@@ -298,6 +298,7 @@ func runAgent(args []string) error {
 	nodeToken := fs.String("token", "", "node token")
 	interval := fs.Duration("interval", 30*time.Second, "heartbeat interval")
 	probeSize := fs.Int("probe-size", 256*1024, "bytes used for active bandwidth probe per direction; set 0 to disable")
+	frpsDashboardURL := fs.String("frps-dashboard-url", "http://127.0.0.1:7500", "local frps dashboard URL used for low-cost traffic counters; empty disables traffic collection")
 	leaveOnExit := fs.Bool("leave-on-exit", false, "mark node offline when the agent exits")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -316,6 +317,9 @@ func runAgent(args []string) error {
 		req := control.HeartbeatRequest{
 			NodeToken: *nodeToken,
 			Network:   network,
+		}
+		if traffic, err := scrapeFRPSTraffic(*frpsDashboardURL); err == nil {
+			req.Traffic = traffic
 		}
 		return postJSON(fmt.Sprintf("%s/api/v1/nodes/%s/heartbeat", controlBase, *nodeID), req, &node)
 	}
@@ -1014,6 +1018,113 @@ func readNetworkDeviceSample() networkDeviceSample {
 		sample.ok = true
 	}
 	return sample
+}
+
+func scrapeFRPSTraffic(baseURL string) (control.TrafficCounters, error) {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		return control.TrafficCounters{}, fmt.Errorf("frps dashboard url is empty")
+	}
+	client := http.Client{Timeout: 3 * time.Second}
+	traffic := control.TrafficCounters{MeasuredAt: time.Now().UTC()}
+	serverInfo, err := getDashboardJSON(client, baseURL+"/api/serverinfo")
+	if err != nil {
+		return control.TrafficCounters{}, err
+	}
+	traffic.TotalInBytes = int64Field(serverInfo, "totalTrafficIn", "total_traffic_in", "trafficIn", "traffic_in")
+	traffic.TotalOutBytes = int64Field(serverInfo, "totalTrafficOut", "total_traffic_out", "trafficOut", "traffic_out")
+	traffic.CurrentConnections = int64Field(serverInfo, "curConns", "cur_conns", "currentConnections")
+	for _, proxyType := range []string{"tcp", "udp", "http", "https", "tcpmux", "stcp", "xtcp", "sudp"} {
+		proxyPayload, err := getDashboardJSON(client, baseURL+"/api/proxy/"+proxyType)
+		if err != nil {
+			continue
+		}
+		proxies, _ := proxyPayload["proxies"].([]any)
+		for _, raw := range proxies {
+			proxy, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			item := control.ProxyTraffic{
+				Name:               stringFieldAny(proxy, "name"),
+				Type:               proxyType,
+				ClientID:           stringFieldAny(proxy, "clientID", "client_id"),
+				TotalInBytes:       int64Field(proxy, "todayTrafficIn", "totalTrafficIn", "trafficIn", "inBytes"),
+				TotalOutBytes:      int64Field(proxy, "todayTrafficOut", "totalTrafficOut", "trafficOut", "outBytes"),
+				CurrentConnections: int64Field(proxy, "curConns", "cur_conns", "currentConnections"),
+				Status:             stringFieldAny(proxy, "status"),
+			}
+			if item.Name == "" {
+				continue
+			}
+			traffic.Proxies = append(traffic.Proxies, item)
+		}
+	}
+	if (traffic.TotalInBytes == 0 && traffic.TotalOutBytes == 0) && len(traffic.Proxies) > 0 {
+		for _, proxy := range traffic.Proxies {
+			traffic.TotalInBytes += proxy.TotalInBytes
+			traffic.TotalOutBytes += proxy.TotalOutBytes
+			traffic.CurrentConnections += proxy.CurrentConnections
+		}
+	}
+	return traffic, nil
+}
+
+func getDashboardJSON(client http.Client, url string) (map[string]any, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("frps dashboard %s status=%d", url, resp.StatusCode)
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func int64Field(value map[string]any, names ...string) int64 {
+	for _, name := range names {
+		raw, ok := value[name]
+		if !ok {
+			continue
+		}
+		switch typed := raw.(type) {
+		case float64:
+			if typed > 0 {
+				return int64(typed)
+			}
+		case int64:
+			if typed > 0 {
+				return typed
+			}
+		case json.Number:
+			if parsed, err := typed.Int64(); err == nil && parsed > 0 {
+				return parsed
+			}
+		case string:
+			if parsed, err := strconv.ParseInt(strings.TrimSpace(typed), 10, 64); err == nil && parsed > 0 {
+				return parsed
+			}
+		}
+	}
+	return 0
+}
+
+func stringFieldAny(value map[string]any, names ...string) string {
+	for _, name := range names {
+		if raw, ok := value[name]; ok {
+			return strings.TrimSpace(fmt.Sprint(raw))
+		}
+	}
+	return ""
 }
 
 func splitCSV(value string) []string {

@@ -19,6 +19,7 @@ source "$ENV_FILE"
 MODE="${MODE:-failover}"
 LIMIT="${LIMIT:-1}"
 INTERVAL="${INTERVAL:-30s}"
+FAILOVER_INTERVAL="${FAILOVER_INTERVAL:-10s}"
 DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-30s}"
 WORK_DIR="${WORK_DIR:-/var/lib/frp-cluster/frpc.d}"
 FRPC_BIN="${FRPC_BIN:-/usr/local/bin/frpc}"
@@ -46,6 +47,7 @@ CLIENT_ID=$CLIENT_ID
 MODE=$MODE
 LIMIT=$LIMIT
 INTERVAL=$INTERVAL
+FAILOVER_INTERVAL=$FAILOVER_INTERVAL
 DRAIN_TIMEOUT=$DRAIN_TIMEOUT
 WORK_DIR=$WORK_DIR
 FRPC_BIN=$FRPC_BIN
@@ -66,6 +68,7 @@ args=(
   --mode "$MODE"
   --limit "$LIMIT"
   --interval "$INTERVAL"
+  --failover-interval "$FAILOVER_INTERVAL"
   --drain-timeout "$DRAIN_TIMEOUT"
   --work-dir "$WORK_DIR"
   --frpc-bin "$FRPC_BIN"

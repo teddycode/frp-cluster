@@ -25,6 +25,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/health", a.handleHealth)
 	mux.HandleFunc("/api/v1/network/probe", a.handleNetworkProbe)
 	mux.HandleFunc("/api/v1/cluster", a.requireAdmin(a.handleCluster))
+	mux.HandleFunc("/api/v1/traffic", a.requireAdmin(a.handleTraffic))
 	mux.HandleFunc("/api/v1/dns/test", a.requireAdmin(a.handleDNSTest))
 	mux.HandleFunc("/api/v1/settings", a.requireAdmin(a.handleSettings))
 	mux.HandleFunc("/api/v1/admin/config", a.requireAdmin(a.handleAdminConfig))
@@ -277,6 +278,23 @@ func (a *API) handleCluster(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, a.store.Snapshot())
+}
+
+func (a *API) handleTraffic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	window := 24 * time.Hour
+	if raw := strings.TrimSpace(r.URL.Query().Get("range")); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil || parsed <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid range")
+			return
+		}
+		window = parsed
+	}
+	writeJSON(w, http.StatusOK, a.store.TrafficSeries(window))
 }
 
 func (a *API) handleSettings(w http.ResponseWriter, r *http.Request) {
@@ -678,8 +696,17 @@ func (a *API) handleJoinCommand(w http.ResponseWriter, r *http.Request) {
 	if q.Get("bind_port") != "" {
 		args = append(args, "--bind-port", shellQuote(q.Get("bind_port")))
 	}
+	if q.Get("vhost_http_port") != "" {
+		args = append(args, "--vhost-http-port", shellQuote(q.Get("vhost_http_port")))
+	}
+	if q.Get("vhost_https_port") != "" {
+		args = append(args, "--vhost-https-port", shellQuote(q.Get("vhost_https_port")))
+	}
 	if q.Get("region") != "" {
 		args = append(args, "--region", shellQuote(q.Get("region")))
+	}
+	if q.Get("tags") != "" {
+		args = append(args, "--tags", shellQuote(q.Get("tags")))
 	}
 	if q.Get("node_control_url") != "" {
 		args = append(args, "--node-control-url", shellQuote(q.Get("node_control_url")))

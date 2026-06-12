@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -101,6 +102,31 @@ func TestReadClusterNodeFromFrpcConfig(t *testing.T) {
 	}
 	if got := readClusterNodeFromFrpcConfig(path); got != "edge-a" {
 		t.Fatalf("node id = %q, want edge-a", got)
+	}
+}
+
+func TestScrapeFRPSTraffic(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/serverinfo":
+			fmt.Fprint(w, `{"totalTrafficIn":50889911,"totalTrafficOut":160233214,"curConns":1}`)
+		case "/api/proxy/tcp":
+			fmt.Fprint(w, `{"proxies":[{"name":"local-ssh.ssh","clientID":"21c99f9313d1d9ef","todayTrafficIn":50889911,"todayTrafficOut":160233214,"curConns":1,"status":"online"}]}`)
+		default:
+			fmt.Fprint(w, `{"proxies":[]}`)
+		}
+	}))
+	defer server.Close()
+
+	traffic, err := scrapeFRPSTraffic(server.URL)
+	if err != nil {
+		t.Fatalf("scrape traffic: %v", err)
+	}
+	if traffic.TotalInBytes != 50889911 || traffic.TotalOutBytes != 160233214 || traffic.CurrentConnections != 1 {
+		t.Fatalf("traffic = %+v", traffic)
+	}
+	if len(traffic.Proxies) != 1 || traffic.Proxies[0].Name != "local-ssh.ssh" || traffic.Proxies[0].Type != "tcp" {
+		t.Fatalf("proxies = %+v", traffic.Proxies)
 	}
 }
 
