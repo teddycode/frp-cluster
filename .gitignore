@@ -3,3 +3,8 @@
 /output/
 /data/
 *.log
+dist/
+*.env.local
+alidns.env
+web/dist/
+web/node_modules/

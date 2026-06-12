@@ -94,6 +94,16 @@ func TestRunHealth(t *testing.T) {
 	}
 }
 
+func TestReadClusterNodeFromFrpcConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "frpc.toml")
+	if err := os.WriteFile(path, []byte("serverAddr = \"203.0.113.10\"\nmetadatas.cluster_node = \"edge-a\"\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if got := readClusterNodeFromFrpcConfig(path); got != "edge-a" {
+		t.Fatalf("node id = %q, want edge-a", got)
+	}
+}
+
 func TestSyncPeerPropagatesAdminLeave(t *testing.T) {
 	storeA := control.NewMemoryStore()
 	storeB := control.NewMemoryStore()

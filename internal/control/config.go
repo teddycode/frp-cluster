@@ -15,10 +15,11 @@ type FrpsConfigOptions struct {
 }
 
 type FrpcConfigOptions struct {
-	ClientID string
-	Mode     string
-	Limit    int
-	Proxies  []ProxySpec
+	ClientID       string
+	Mode           string
+	Limit          int
+	Proxies        []ProxySpec
+	ExcludeNodeIDs []string
 }
 
 type ProxySpec struct {
@@ -78,7 +79,7 @@ func (s *Store) GenerateFrpcConfig(opts FrpcConfigOptions) (string, error) {
 		clientID = "client"
 	}
 	s.mu.RLock()
-	nodes, err := s.selectNodesLocked(clientID, mode, opts.Limit)
+	nodes, err := s.selectNodesLocked(clientID, mode, opts.Limit, opts.ExcludeNodeIDs...)
 	s.mu.RUnlock()
 	if err != nil {
 		return "", err
@@ -119,7 +120,7 @@ func (s *Store) GenerateFrpcConfigFiles(opts FrpcConfigOptions) (map[string]stri
 		clientID = "client"
 	}
 	s.mu.RLock()
-	nodes, err := s.selectNodesLocked(clientID, mode, opts.Limit)
+	nodes, err := s.selectNodesLocked(clientID, mode, opts.Limit, opts.ExcludeNodeIDs...)
 	s.mu.RUnlock()
 	if err != nil {
 		return nil, err

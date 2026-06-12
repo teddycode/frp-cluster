@@ -21,11 +21,13 @@ FRP_NUM="${FRP_VERSION#v}"
 
 cd "$ROOT"
 GOCACHE=/tmp/go-build-cache GOMODCACHE=/tmp/go-mod-cache go test ./...
+npm install --prefix web
+npm run build --prefix web
 
 for ARCH in $ARCHES; do
   PKG="frp-cluster-bundle-linux-$ARCH"
   PKGDIR="$WORK/$PKG"
-  mkdir -p "$PKGDIR/bin" "$PKGDIR/scripts" "$PKGDIR/systemd" "$PKGDIR/examples" "$PKGDIR/docs"
+  mkdir -p "$PKGDIR/bin" "$PKGDIR/scripts" "$PKGDIR/systemd" "$PKGDIR/examples" "$PKGDIR/docs" "$PKGDIR/web"
 
   CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" GOCACHE=/tmp/go-build-cache GOMODCACHE=/tmp/go-mod-cache \
     go build -buildvcs=false -trimpath -ldflags="-s -w" -o "$PKGDIR/bin/frp-cluster" ./cmd/frp-cluster
@@ -43,8 +45,9 @@ for ARCH in $ARCHES; do
   cp "$ROOT"/scripts/proxy-node-join.sh "$ROOT"/scripts/proxy-node-leave.sh "$ROOT"/scripts/client-install.sh "$PKGDIR/scripts/"
   chmod +x "$PKGDIR"/scripts/*.sh
   cp "$ROOT"/systemd/*.service "$PKGDIR/systemd/"
-  cp "$ROOT"/examples/*.example "$PKGDIR/examples/"
+  cp "$ROOT"/examples/* "$PKGDIR/examples/"
   cp "$ROOT"/docs/*.md "$PKGDIR/docs/"
+  cp -a "$ROOT"/web/dist/. "$PKGDIR/web/"
   cp "$ROOT/README.md" "$PKGDIR/README.md"
 
   cat > "$PKGDIR/README-bundle.md" <<EOF

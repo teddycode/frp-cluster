@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -270,6 +272,33 @@ func TestGenerateFrpcFailoverSticksToCurrentClientNodeUntilManualSwitch(t *testi
 	}
 }
 
+func TestGenerateFrpcFailoverCanExcludeFailedCurrentNode(t *testing.T) {
+	store := NewMemoryStore()
+	nodeA := joinTestNode(t, store, "edge-a", "203.0.113.10")
+	nodeB := joinTestNode(t, store, "edge-b", "203.0.113.11")
+	if _, err := store.HeartbeatNode(nodeA.Node.ID, nodeA.NodeToken); err != nil {
+		t.Fatalf("heartbeat edge-a: %v", err)
+	}
+	if _, err := store.HeartbeatNode(nodeB.Node.ID, nodeB.NodeToken); err != nil {
+		t.Fatalf("heartbeat edge-b: %v", err)
+	}
+	if err := store.ApplyPluginEvent(nodeA.Node.ID, PluginEvent{Op: "Login", ClientID: "app-1"}); err != nil {
+		t.Fatalf("apply plugin login: %v", err)
+	}
+	files, err := store.GenerateFrpcConfigFiles(FrpcConfigOptions{
+		ClientID:       "app-1",
+		Mode:           ConfigModeFailover,
+		Limit:          1,
+		ExcludeNodeIDs: []string{"edge-a"},
+	})
+	if err != nil {
+		t.Fatalf("generate files: %v", err)
+	}
+	if _, ok := files["frpc-app-1-edge-b.toml"]; !ok {
+		t.Fatalf("excluded current node did not fail over to edge-b: %#v", files)
+	}
+}
+
 func TestMigrationRecommendationTargetsBetterNetworkNode(t *testing.T) {
 	store := NewMemoryStore()
 	nodeA := joinTestNode(t, store, "edge-a", "203.0.113.10")
@@ -479,6 +508,225 @@ func TestAPIAdminLeaveAndPeerState(t *testing.T) {
 	}
 }
 
+func TestAPIManualSwitchRequiresDNSHookByDefault(t *testing.T) {
+	store := NewMemoryStore()
+	server := httptest.NewServer(NewAPI(store).Handler())
+	defer server.Close()
+	nodeA := joinTestNode(t, store, "edge-a", "203.0.113.10")
+	joinTestNode(t, store, "edge-b", "203.0.113.11")
+	if err := store.ApplyPluginEvent(nodeA.Node.ID, PluginEvent{Op: "Login", ClientID: "app-1"}); err != nil {
+		t.Fatalf("apply login: %v", err)
+	}
+	resp, err := http.Post(server.URL+"/api/v1/clients/app-1/target", "application/json", strings.NewReader(`{"node_id":"edge-b"}`))
+	if err != nil {
+		t.Fatalf("post target: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusPreconditionRequired {
+		t.Fatalf("status = %d, want precondition required", resp.StatusCode)
+	}
+	client := store.Snapshot().Clients[0]
+	if client.PreferredNodeID != "" || client.MigrationState != "" {
+		t.Fatalf("client target changed despite missing DNS hook: %+v", client)
+	}
+}
+
+func TestAPIManualSwitchRunsDNSHookBeforeSettingTarget(t *testing.T) {
+	store := NewMemoryStore()
+	nodeA := joinTestNode(t, store, "edge-a", "203.0.113.10")
+	nodeB := joinTestNode(t, store, "edge-b", "203.0.113.11")
+	hookLog := filepath.Join(t.TempDir(), "dns.log")
+	hook := filepath.Join(t.TempDir(), "dns-hook.sh")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf '%s %s %s %s\\n' \"$FRP_CLUSTER_DNS_HOST\" \"$FRP_CLUSTER_DNS_TARGET_IP\" \"$FRP_CLUSTER_NODE_ID\" \"$FRP_CLUSTER_CLIENT_ID\" >> "+shellQuoteForTest(hookLog)+"\n"), 0o755); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+	if err := store.ConfigureControlPlaneWithOptions(ControlPlaneOptions{PublicEntryHost: "ssh-proxy.example.com", DNSUpdateHook: hook}); err != nil {
+		t.Fatalf("configure control plane: %v", err)
+	}
+	if err := store.ApplyPluginEvent(nodeA.Node.ID, PluginEvent{Op: "Login", ClientID: "app-1"}); err != nil {
+		t.Fatalf("apply login: %v", err)
+	}
+	server := httptest.NewServer(NewAPI(store).Handler())
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/api/v1/clients/app-1/target", "application/json", strings.NewReader(`{"node_id":"edge-b"}`))
+	if err != nil {
+		t.Fatalf("post target: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want ok", resp.StatusCode)
+	}
+	client := store.Snapshot().Clients[0]
+	if client.PreferredNodeID != nodeB.Node.ID || client.MigrationState != MigrationStateManual {
+		t.Fatalf("client target = %+v, want manual edge-b", client)
+	}
+	logData, err := os.ReadFile(hookLog)
+	if err != nil {
+		t.Fatalf("read hook log: %v", err)
+	}
+	want := "ssh-proxy.example.com 203.0.113.11 edge-b app-1"
+	if !strings.Contains(string(logData), want) {
+		t.Fatalf("hook log = %q, want %q", logData, want)
+	}
+	snapshot := store.Snapshot()
+	if snapshot.Summary.SwitchesThisMonth != 1 || len(snapshot.SwitchMetrics) == 0 || snapshot.SwitchMetrics[0].Manual != 1 {
+		t.Fatalf("switch metrics = %+v summary=%+v", snapshot.SwitchMetrics, snapshot.Summary)
+	}
+}
+
+func TestAPIDNSTestRequiresHook(t *testing.T) {
+	store := NewMemoryStore()
+	joinTestNode(t, store, "edge-a", "203.0.113.10")
+	server := httptest.NewServer(NewAPI(store).Handler())
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/api/v1/dns/test", "application/json", strings.NewReader(`{"node_id":"edge-a"}`))
+	if err != nil {
+		t.Fatalf("post dns test: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusPreconditionRequired {
+		t.Fatalf("status = %d, want precondition required", resp.StatusCode)
+	}
+}
+
+func TestAPIDNSTestRunsHookAndRecordsEvent(t *testing.T) {
+	store := NewMemoryStore()
+	joinTestNode(t, store, "edge-a", "203.0.113.10")
+	hookLog := filepath.Join(t.TempDir(), "dns-test.log")
+	hook := filepath.Join(t.TempDir(), "dns-hook.sh")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf '%s %s %s %s\\n' \"$FRP_CLUSTER_DNS_HOST\" \"$FRP_CLUSTER_DNS_TARGET_IP\" \"$FRP_CLUSTER_NODE_ID\" \"$FRP_CLUSTER_CLIENT_ID\" >> "+shellQuoteForTest(hookLog)+"\n"), 0o755); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+	if err := store.ConfigureControlPlaneWithOptions(ControlPlaneOptions{PublicEntryHost: "ssh-proxy.example.com", DNSUpdateHook: hook}); err != nil {
+		t.Fatalf("configure control plane: %v", err)
+	}
+	server := httptest.NewServer(NewAPI(store).Handler())
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/api/v1/dns/test", "application/json", strings.NewReader(`{"node_id":"edge-a","client_id":"app-1"}`))
+	if err != nil {
+		t.Fatalf("post dns test: %v", err)
+	}
+	var body struct {
+		DNS DNSUpdateResult `json:"dns"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode dns test response: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want ok", resp.StatusCode)
+	}
+	if !body.DNS.Updated || body.DNS.TargetIP != "203.0.113.10" || body.DNS.NodeID != "edge-a" {
+		t.Fatalf("dns response = %+v", body.DNS)
+	}
+	logData, err := os.ReadFile(hookLog)
+	if err != nil {
+		t.Fatalf("read hook log: %v", err)
+	}
+	want := "ssh-proxy.example.com 203.0.113.10 edge-a app-1"
+	if !strings.Contains(string(logData), want) {
+		t.Fatalf("hook log = %q, want %q", logData, want)
+	}
+	events := store.Snapshot().Events
+	if len(events) == 0 || events[0].Type != "dns.tested" {
+		t.Fatalf("latest event = %+v, want dns.tested", events)
+	}
+}
+
+func TestAPIAdminAuthProtectsCluster(t *testing.T) {
+	store := NewMemoryStore()
+	server := httptest.NewServer(NewAPIWithOptions(store, RuntimeOptions{AdminPassword: "secret"}).Handler())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/api/v1/cluster")
+	if err != nil {
+		t.Fatalf("get cluster: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("cluster status = %d, want unauthorized", resp.StatusCode)
+	}
+
+	client := server.Client()
+	loginResp, err := client.Post(server.URL+"/api/v1/auth/login", "application/json", strings.NewReader(`{"password":"secret"}`))
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	_ = loginResp.Body.Close()
+	if loginResp.StatusCode != http.StatusOK {
+		t.Fatalf("login status = %d, want ok", loginResp.StatusCode)
+	}
+	req, _ := http.NewRequest(http.MethodGet, server.URL+"/api/v1/cluster", nil)
+	for _, cookie := range loginResp.Cookies() {
+		req.AddCookie(cookie)
+	}
+	authedResp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("get authed cluster: %v", err)
+	}
+	_ = authedResp.Body.Close()
+	if authedResp.StatusCode != http.StatusOK {
+		t.Fatalf("authed cluster status = %d, want ok", authedResp.StatusCode)
+	}
+}
+
+func TestAPISettingsUpdateAutoMigration(t *testing.T) {
+	store := NewMemoryStore()
+	server := httptest.NewServer(NewAPI(store).Handler())
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPatch, server.URL+"/api/v1/settings", strings.NewReader(`{"auto_migration":false,"migration_score_gap":42,"public_entry_host":"ssh.buaadcl.tech","dns_update_hook":"/usr/local/bin/frp-cluster-dns"}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("content-type", "application/json")
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("patch settings: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	config := store.Snapshot().Config
+	if config.AutoMigration == nil || *config.AutoMigration || config.MigrationScoreGap != 42 || config.PublicEntryHost != "ssh.buaadcl.tech" || config.DNSUpdateHook != "/usr/local/bin/frp-cluster-dns" {
+		t.Fatalf("config = %+v", config)
+	}
+}
+
+func TestAutoSwitchCandidatesAndMetrics(t *testing.T) {
+	store := NewMemoryStore()
+	nodeA := joinTestNode(t, store, "edge-a", "203.0.113.10")
+	nodeB := joinTestNode(t, store, "edge-b", "203.0.113.11")
+	if _, err := store.HeartbeatNode(nodeA.Node.ID, nodeA.NodeToken, NetworkStatus{LatencyMS: 200, DownloadBandwidthBps: 5_000_000, UploadBandwidthBps: 5_000_000}); err != nil {
+		t.Fatalf("heartbeat edge-a: %v", err)
+	}
+	if _, err := store.HeartbeatNode(nodeB.Node.ID, nodeB.NodeToken, NetworkStatus{LatencyMS: 10, DownloadBandwidthBps: 500_000_000, UploadBandwidthBps: 500_000_000}); err != nil {
+		t.Fatalf("heartbeat edge-b: %v", err)
+	}
+	if err := store.ApplyPluginEvent(nodeA.Node.ID, PluginEvent{Op: "Login", ClientID: "app-1"}); err != nil {
+		t.Fatalf("apply login: %v", err)
+	}
+	candidates := store.AutoSwitchCandidates()
+	if len(candidates) != 1 || candidates[0].NodeID != "edge-b" {
+		t.Fatalf("candidates = %+v", candidates)
+	}
+	if _, err := store.AutoSwitchClientTarget(candidates[0].ClientID, candidates[0].NodeID, candidates[0].Reason); err != nil {
+		t.Fatalf("auto switch: %v", err)
+	}
+	snapshot := store.Snapshot()
+	if snapshot.Clients[0].PreferredNodeID != "edge-b" || snapshot.Clients[0].MigrationState != MigrationStateManual {
+		t.Fatalf("client = %+v", snapshot.Clients[0])
+	}
+	if snapshot.Summary.SwitchesThisMonth != 1 || snapshot.SwitchMetrics[0].Automatic != 1 {
+		t.Fatalf("switch metrics = %+v summary=%+v", snapshot.SwitchMetrics, snapshot.Summary)
+	}
+}
+
 func TestAPIHeartbeatAcceptsNetworkMetrics(t *testing.T) {
 	store := NewMemoryStore()
 	server := httptest.NewServer(NewAPI(store).Handler())
@@ -503,6 +751,10 @@ func TestAPIHeartbeatAcceptsNetworkMetrics(t *testing.T) {
 	if node.Network.LatencyMS != 35 || node.Network.BandwidthBps != 60_000_000 || node.Network.Score == 0 {
 		t.Fatalf("node network = %+v", node.Network)
 	}
+}
+
+func shellQuoteForTest(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 func TestAPINetworkProbe(t *testing.T) {

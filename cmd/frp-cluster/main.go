@@ -45,6 +45,8 @@ func main() {
 		err = runConfig(os.Args[2:])
 	case "health":
 		err = runHealth(os.Args[2:])
+	case "dns":
+		err = runDNS(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -60,13 +62,14 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `frp-cluster controls frps clusters.
 
 Usage:
-  frp-cluster server --listen :8080 --data ./data/cluster.json --public-url http://203.0.113.10:8080 --peer http://203.0.113.11:8080
+  frp-cluster server --listen :8080 --data ./data/cluster.json --public-url http://203.0.113.10:8080 --public-entry-host ssh.buaadcl.tech --dns-update-hook /usr/local/bin/frp-cluster-alidns-update --peer http://203.0.113.11:8080
   frp-cluster token --control-url http://127.0.0.1:8080 --ttl 2h --uses 1
   frp-cluster join --control-url http://127.0.0.1:8080 --token TOKEN --node-id edge-a --public-addr 203.0.113.10 --node-control-url http://203.0.113.10:8080 --write-frps-config ./frps.toml
   frp-cluster agent --control-url http://127.0.0.1:8080 --node-id edge-a --token NODE_TOKEN
   frp-cluster client --control-url http://127.0.0.1:8080 --client-id app-1 --proxy web:tcp:127.0.0.1:8080:18080
   frp-cluster leave --control-url http://127.0.0.1:8080 --node-id edge-a --token NODE_TOKEN
   frp-cluster health --control-url http://127.0.0.1:8080 --timeout 5s
+  frp-cluster dns alidns-update --config /etc/frp-cluster/alidns.env
   frp-cluster config frps --control-url http://127.0.0.1:8080 --node-id edge-a
   frp-cluster config frpc --control-url http://127.0.0.1:8080 --client-id app-1 --mode aggregate
   frp-cluster config frpc --control-url http://127.0.0.1:8080 --client-id app-1 --mode aggregate --out-dir ./frpc.d`)
@@ -77,6 +80,12 @@ func runServer(args []string) error {
 	listen := fs.String("listen", ":8080", "HTTP listen address")
 	data := fs.String("data", "./data/cluster.json", "state file path")
 	publicURL := fs.String("public-url", "", "public control plane URL for this node")
+	publicEntryHost := fs.String("public-entry-host", "", "stable DNS entry users should connect to")
+	dnsUpdateHook := fs.String("dns-update-hook", "", "executable hook to update the stable DNS entry before manual switch")
+	webDir := fs.String("web-dir", "./web/dist", "static web frontend directory")
+	adminPassword := fs.String("admin-password", "", "admin web password; prefer --admin-password-file in production")
+	adminPasswordFile := fs.String("admin-password-file", "", "file containing admin web password")
+	autoSwitchInterval := fs.Duration("auto-switch-interval", 30*time.Second, "interval for applying enabled automatic switch recommendations")
 	peerSyncInterval := fs.Duration("peer-sync-interval", 10*time.Second, "peer state synchronization interval")
 	peers := multiFlag{}
 	fs.Var(&peers, "peer", "peer control plane URL; repeatable")
@@ -87,13 +96,23 @@ func runServer(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := store.ConfigureControlPlane(*publicURL, peers); err != nil {
+	if err := store.ConfigureControlPlaneWithOptions(control.ControlPlaneOptions{
+		PublicURL:       *publicURL,
+		PeerURLs:        peers,
+		PublicEntryHost: *publicEntryHost,
+		DNSUpdateHook:   *dnsUpdateHook,
+	}); err != nil {
 		return err
 	}
 	if len(peers) > 0 || *publicURL != "" {
 		go runPeerSync(store, *publicURL, *peerSyncInterval)
 	}
-	api := control.NewAPI(store)
+	go runAutoSwitch(store, *autoSwitchInterval)
+	api := control.NewAPIWithOptions(store, control.RuntimeOptions{
+		WebDir:            *webDir,
+		AdminPassword:     *adminPassword,
+		AdminPasswordFile: *adminPasswordFile,
+	})
 	server := &http.Server{
 		Addr:              *listen,
 		Handler:           api.Handler(),
@@ -101,6 +120,42 @@ func runServer(args []string) error {
 	}
 	log.Printf("frp-cluster control plane listening on %s public_url=%s peers=%d", *listen, *publicURL, len(peers))
 	return server.ListenAndServe()
+}
+
+func runAutoSwitch(store *control.Store, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		for _, candidate := range store.AutoSwitchCandidates() {
+			if _, err := store.UpdateDNSForNode(candidate.ClientID, candidate.NodeID); err != nil {
+				log.Printf("auto switch dns update failed client=%s node=%s: %v", candidate.ClientID, candidate.NodeID, err)
+				continue
+			}
+			if _, err := store.AutoSwitchClientTarget(candidate.ClientID, candidate.NodeID, candidate.Reason); err != nil {
+				log.Printf("auto switch target failed client=%s node=%s: %v", candidate.ClientID, candidate.NodeID, err)
+			}
+		}
+	}
+}
+
+func runDNS(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("dns requires alidns-update")
+	}
+	switch args[0] {
+	case "alidns-update":
+		fs := flag.NewFlagSet("dns alidns-update", flag.ExitOnError)
+		configPath := fs.String("config", "/etc/frp-cluster/alidns.env", "AliDNS env config file")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		return runAliDNSUpdate(*configPath)
+	default:
+		return fmt.Errorf("unknown dns command %q", args[0])
+	}
 }
 
 func runPeerSync(store *control.Store, publicURL string, interval time.Duration) {
@@ -148,11 +203,12 @@ func runToken(args []string) error {
 	controlURL := fs.String("control-url", "http://127.0.0.1:8080", "control plane URL")
 	ttl := fs.String("ttl", "2h", "token TTL")
 	uses := fs.Int("uses", 1, "token uses")
+	adminPasswordFile := fs.String("admin-password-file", "", "admin password file for protected control planes")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	var resp control.JoinToken
-	if err := postJSON(*controlURL+"/api/v1/tokens", map[string]any{"ttl": *ttl, "uses": *uses}, &resp); err != nil {
+	if err := postAdminJSON(*controlURL, "/api/v1/tokens", map[string]any{"ttl": *ttl, "uses": *uses}, &resp, *adminPasswordFile); err != nil {
 		return err
 	}
 	fmt.Println(resp.Token)
@@ -290,6 +346,7 @@ func runClient(args []string) error {
 	mode := fs.String("mode", control.ConfigModeFailover, "single, failover, or aggregate")
 	limit := fs.Int("limit", 1, "node limit for single/failover process set")
 	interval := fs.Duration("interval", 30*time.Second, "config refresh interval")
+	failoverInterval := fs.Duration("failover-interval", 10*time.Second, "retry interval after frpc exits or control plane is unreachable")
 	drainTimeout := fs.Duration("drain-timeout", 30*time.Second, "time to keep old frpc processes after a better node starts")
 	workDir := fs.String("work-dir", "./frpc.d", "directory for synchronized frpc configs")
 	frpcBin := fs.String("frpc-bin", "frpc", "frpc executable path")
@@ -318,8 +375,8 @@ func runClient(args []string) error {
 	}
 	manager := newFrpcManager(*frpcBin, *noRun, *drainTimeout)
 	defer manager.stopAll()
-	syncOnce := func() error {
-		files, err := fetchFrpcConfigFiles(*controlURL, *clientID, *mode, *limit, proxyQuery)
+	syncOnce := func(excludeNodes ...string) error {
+		files, err := fetchFrpcConfigFiles(*controlURL, *clientID, *mode, *limit, proxyQuery, excludeNodes...)
 		if err != nil {
 			return err
 		}
@@ -342,12 +399,22 @@ func runClient(args []string) error {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	ticker := time.NewTicker(*interval)
+	failoverTicker := time.NewTicker(*failoverInterval)
 	defer ticker.Stop()
+	defer failoverTicker.Stop()
 	for {
 		select {
 		case <-ticker.C:
 			if err := syncOnce(); err != nil {
-				return err
+				fmt.Fprintf(os.Stderr, "client sync failed: %v\n", err)
+			}
+		case <-failoverTicker.C:
+			exited := manager.exitedNodeIDs()
+			if len(exited) > 0 {
+				fmt.Fprintf(os.Stderr, "frpc process exited, retrying config sync exclude=%s\n", strings.Join(exited, ","))
+				if err := syncOnce(exited...); err != nil {
+					fmt.Fprintf(os.Stderr, "client failover sync failed: %v\n", err)
+				}
 			}
 		case <-signals:
 			return nil
@@ -441,6 +508,52 @@ func postJSON(url string, value any, target any) error {
 	return postJSONWithTimeout(url, value, target, 0)
 }
 
+func postAdminJSON(controlURL, path string, value any, target any, adminPasswordFile string) error {
+	client := &http.Client{}
+	base := strings.TrimRight(controlURL, "/")
+	err := postJSONWithClient(client, base+path, value, target)
+	if err == nil || adminPasswordFile == "" || !strings.Contains(err.Error(), "401") {
+		return err
+	}
+	password, readErr := os.ReadFile(adminPasswordFile)
+	if readErr != nil {
+		return err
+	}
+	var loginResp map[string]bool
+	if loginErr := postJSONWithClient(client, base+"/api/v1/auth/login", map[string]string{"password": strings.TrimSpace(string(password))}, &loginResp); loginErr != nil {
+		return loginErr
+	}
+	return postJSONWithClient(client, base+path, value, target)
+}
+
+func postJSONWithClient(client *http.Client, url string, value any, target any) error {
+	body, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(data)))
+	}
+	if target == nil {
+		return nil
+	}
+	if err := json.Unmarshal(data, target); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+	return nil
+}
+
 func postJSONWithTimeout(url string, value any, target any, timeout time.Duration) error {
 	body, err := json.Marshal(value)
 	if err != nil {
@@ -510,8 +623,13 @@ func getJSONWithTimeout(url string, target any, timeout time.Duration) error {
 	return nil
 }
 
-func fetchFrpcConfigFiles(controlURL, clientID, mode string, limit int, proxyQuery string) (map[string]string, error) {
+func fetchFrpcConfigFiles(controlURL, clientID, mode string, limit int, proxyQuery string, excludeNodeIDs ...string) (map[string]string, error) {
 	url := fmt.Sprintf("%s/api/v1/config/frpc?client_id=%s&mode=%s&limit=%d&format=json%s", strings.TrimRight(controlURL, "/"), urlQueryEscape(clientID), urlQueryEscape(mode), limit, proxyQuery)
+	for _, nodeID := range excludeNodeIDs {
+		if nodeID = strings.TrimSpace(nodeID); nodeID != "" {
+			url += "&exclude_node=" + urlQueryEscape(nodeID)
+		}
+	}
 	var payload struct {
 		Files map[string]string `json:"files"`
 	}
@@ -680,6 +798,22 @@ func (m *frpcManager) stopAll() {
 	}
 }
 
+func (m *frpcManager) exitedNodeIDs() []string {
+	nodes := make([]string, 0)
+	seen := map[string]bool{}
+	for path, process := range m.processes {
+		if !processRunning(process) {
+			nodeID := readClusterNodeFromFrpcConfig(path)
+			if nodeID != "" && !seen[nodeID] {
+				nodes = append(nodes, nodeID)
+				seen[nodeID] = true
+			}
+		}
+	}
+	sort.Strings(nodes)
+	return nodes
+}
+
 func processRunning(process *frpcProcess) bool {
 	if process == nil || process.cmd == nil {
 		return true
@@ -693,6 +827,25 @@ func processRunning(process *frpcProcess) bool {
 	default:
 		return true
 	}
+}
+
+func readClusterNodeFromFrpcConfig(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "metadatas.cluster_node") {
+			continue
+		}
+		_, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		return strings.Trim(strings.TrimSpace(value), `"`)
+	}
+	return ""
 }
 
 type networkCollector struct {

@@ -100,6 +100,10 @@ VHOST_HTTPS_PORT=0
 
 CONTROL_LISTEN=:8088
 CONTROL_DATA=/var/lib/frp-cluster/cluster.json
+PUBLIC_ENTRY_HOST=ssh.buaadcl.tech
+DNS_UPDATE_HOOK=/usr/local/bin/frp-cluster-alidns-update
+WEB_DIR=/usr/local/share/frp-cluster/web
+ADMIN_PASSWORD_FILE=/etc/frp-cluster/admin-password
 
 REGION=
 TAGS=
@@ -113,6 +117,14 @@ EOF
 新代理节点公网IP
 edge-new
 替换为上一步生成的join_token
+```
+
+如果还没有正式域名，可以先把 `PUBLIC_ENTRY_HOST` 留空；确认域名后再写入 `/etc/frp-cluster/node.env` 并重启控制面：
+
+```bash
+sudo sed -i 's/^PUBLIC_ENTRY_HOST=.*/PUBLIC_ENTRY_HOST=ssh.buaadcl.tech/' /etc/frp-cluster/node.env
+sudo sed -i 's#^DNS_UPDATE_HOOK=.*#DNS_UPDATE_HOOK=/usr/local/bin/frp-cluster-alidns-update#' /etc/frp-cluster/node.env
+sudo systemctl restart frp-cluster-control
 ```
 
 `NODE_ID` 必须全局唯一，例如：
@@ -391,19 +403,19 @@ PROXIES='ssh:tcp:127.0.0.1:22:11022'
 外部用户不要直接访问代理节点 IP，应访问稳定 DNS 名称。例如：
 
 ```text
-ssh-proxy.example.com:11022
+ssh.buaadcl.tech:11022
 ```
 
-DNS 解析由运维人员控制：
+DNS 解析由控制面切换 hook 更新。初始记录应指向当前节点：
 
 ```text
-ssh-proxy.example.com A 124.71.154.57
+ssh.buaadcl.tech A 124.71.154.57
 ```
 
-如果要把外部入口切到新代理节点，只改 DNS 记录：
+如果要把外部入口切到新代理节点，管理端切换会调用 hook 把 DNS 改成：
 
 ```text
-ssh-proxy.example.com A 新代理节点公网IP
+ssh.buaadcl.tech A 新代理节点公网IP
 ```
 
 客户端配置里的 `CONTROL_URL`、`CLIENT_ID`、`PROXIES` 都不需要变化。
@@ -436,18 +448,38 @@ http://124.71.154.57:8088/
 ```text
 1. 找到客户端，例如 local-ssh。
 2. 在目标节点下拉框里选择新代理节点，例如 edge-new。
-3. 点击“切换”。
+3. 点击“切换并更新 DNS”。
 4. 等待客户端下一次同步，默认最多 30 秒。
 5. 确认 frpc 配置里的 serverAddr 已变成新节点公网 IP。
 ```
 
-也可以用 API 手动切换：
+如果 `PUBLIC_ENTRY_HOST` 或 `DNS_UPDATE_HOOK` 未配置，管理端会拒绝切换，避免客户端已经切到新节点但外部稳定域名还指向旧节点。
+
+切换前建议先在“代理服务器集群”表里对当前节点点击“DNS 自检”。这个动作会真实执行 `DNS_UPDATE_HOOK`，把稳定入口 DNS 指向所选节点。生产环境第一次配置 Hook 时，先选当前正在承载流量的节点自检，避免自检本身改变入口。
+
+也可以用 API 自检 DNS Hook：
+
+```bash
+curl -X POST http://124.71.154.57:8088/api/v1/dns/test \
+  -H 'content-type: application/json' \
+  -d '{"node_id":"edge-124","client_id":"local-ssh"}'
+```
+
+成功后再确认 DNS 已解析到该节点公网 IP：
+
+```bash
+dig +short ssh.buaadcl.tech
+```
+
+也可以用 API 手动切换并更新 DNS：
 
 ```bash
 curl -X POST http://124.71.154.57:8088/api/v1/clients/local-ssh/target \
   -H 'content-type: application/json' \
   -d '{"node_id":"edge-new"}'
 ```
+
+非空 `node_id` 会强制先执行 DNS 更新 hook；hook 失败则不会写入客户端目标，客户端也不会切换。目标节点必须在线，否则控制面也会拒绝切换。
 
 清除手动目标：
 
@@ -457,18 +489,56 @@ curl -X POST http://124.71.154.57:8088/api/v1/clients/local-ssh/target \
   -d '{"node_id":""}'
 ```
 
-### 2. 同步切换 DNS 入口
+### 2. 配置 DNS 更新 Hook
 
-手动切换客户端到新代理节点后，外部入口也要指向新代理节点：
+控制面切换前会执行 `DNS_UPDATE_HOOK` 指向的脚本。脚本成功退出后，控制面才会写入客户端手动目标。
+
+Hook 会收到这些环境变量：
 
 ```text
-ssh-proxy.example.com A 新代理节点公网IP
+FRP_CLUSTER_DNS_HOST       稳定入口域名，例如 ssh.buaadcl.tech
+FRP_CLUSTER_DNS_TARGET_IP  目标代理节点公网 IP
+FRP_CLUSTER_NODE_ID        目标代理节点 ID
+FRP_CLUSTER_CLIENT_ID      被切换的客户端 ID
 ```
+
+阿里云 DNS 配置文件放在 `/etc/frp-cluster/alidns.env`，权限建议 `0600`：
+
+```bash
+sudo tee /etc/frp-cluster/alidns.env >/dev/null <<'EOF'
+ALIDNS_ACCESS_KEY_ID=替换为AccessKeyID
+ALIDNS_ACCESS_KEY_SECRET=替换为AccessKeySecret
+ALIDNS_DOMAIN_NAME=buaadcl.tech
+ALIDNS_RR=
+ALIDNS_RECORD_TYPE=A
+ALIDNS_TTL=600
+ALIDNS_ENDPOINT=alidns.cn-hangzhou.aliyuncs.com
+ALIDNS_LINE=default
+EOF
+sudo chmod 0600 /etc/frp-cluster/alidns.env
+```
+
+DNS Hook 脚本调用内置阿里云更新器：
+
+```bash
+sudo tee /usr/local/bin/frp-cluster-alidns-update >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${FRP_CLUSTER_DNS_HOST:?}"
+: "${FRP_CLUSTER_DNS_TARGET_IP:?}"
+
+/usr/local/bin/frp-cluster dns alidns-update --config /etc/frp-cluster/alidns.env
+EOF
+sudo chmod 0755 /usr/local/bin/frp-cluster-alidns-update
+```
+
+如果阿里云中还没有对应 A 记录，更新器会自动创建；已有记录则更新到目标代理节点公网 IP。
 
 建议 DNS TTL 设置为较短值，例如：
 
 ```text
-TTL 60
+TTL 600
 ```
 
 切换前先确认新节点已经监听业务端口：
@@ -481,7 +551,7 @@ sudo ss -ltnp | grep ':11022'
 从任意外部机器验证稳定入口：
 
 ```bash
-ssh-keyscan -p 11022 -T 5 ssh-proxy.example.com
+ssh-keyscan -p 11022 -T 5 ssh.buaadcl.tech
 ```
 
 ### 3. 查看当前客户端实际目标

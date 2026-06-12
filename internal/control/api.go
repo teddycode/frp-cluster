@@ -1,37 +1,37 @@
 package control
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 )
 
-type API struct {
-	store *Store
-}
-
-func NewAPI(store *Store) *API {
-	return &API{store: store}
-}
-
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", a.handleIndex)
+	mux.HandleFunc("/", a.handleWeb)
+	mux.HandleFunc("/api/v1/auth/login", a.handleLogin)
+	mux.HandleFunc("/api/v1/auth/logout", a.handleLogout)
+	mux.HandleFunc("/api/v1/auth/me", a.handleAuthMe)
 	mux.HandleFunc("/api/v1/health", a.handleHealth)
 	mux.HandleFunc("/api/v1/network/probe", a.handleNetworkProbe)
-	mux.HandleFunc("/api/v1/cluster", a.handleCluster)
-	mux.HandleFunc("/api/v1/tokens", a.handleTokens)
+	mux.HandleFunc("/api/v1/cluster", a.requireAdmin(a.handleCluster))
+	mux.HandleFunc("/api/v1/dns/test", a.requireAdmin(a.handleDNSTest))
+	mux.HandleFunc("/api/v1/settings", a.requireAdmin(a.handleSettings))
+	mux.HandleFunc("/api/v1/tokens", a.requireAdmin(a.handleTokens))
 	mux.HandleFunc("/api/v1/nodes/join", a.handleJoinNode)
 	mux.HandleFunc("/api/v1/nodes/", a.handleNodeAction)
-	mux.HandleFunc("/api/v1/clients/", a.handleClientAction)
+	mux.HandleFunc("/api/v1/clients/", a.requireAdmin(a.handleClientAction))
 	mux.HandleFunc("/api/v1/config/frps", a.handleFrpsConfig)
 	mux.HandleFunc("/api/v1/config/frpc", a.handleFrpcConfig)
-	mux.HandleFunc("/api/v1/commands/join", a.handleJoinCommand)
+	mux.HandleFunc("/api/v1/commands/join", a.requireAdmin(a.handleJoinCommand))
 	mux.HandleFunc("/api/v1/peer/state", a.handlePeerState)
 	mux.HandleFunc("/api/v1/frp/plugin", a.handlePlugin)
 	mux.HandleFunc("/api/v1/frp/plugin/", a.handlePlugin)
@@ -46,13 +46,90 @@ func withCommonHeaders(next http.Handler) http.Handler {
 	})
 }
 
-func (a *API) handleIndex(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
+func (a *API) handleWeb(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/api/") {
 		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = io.WriteString(w, indexHTML)
+	webDir := resolveWebDir(a.webDir)
+	if webDir == "" {
+		writeError(w, http.StatusNotFound, "web assets not configured")
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/")
+	if path == "" {
+		path = "index.html"
+	}
+	fullPath := filepath.Join(webDir, path)
+	if rel, err := filepath.Rel(webDir, fullPath); err != nil || strings.HasPrefix(rel, "..") {
+		http.NotFound(w, r)
+		return
+	}
+	if info, err := os.Stat(fullPath); err == nil && !info.IsDir() {
+		http.ServeFile(w, r, fullPath)
+		return
+	}
+	http.ServeFile(w, r, filepath.Join(webDir, "index.html"))
+}
+
+func (a *API) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !a.validSession(r) {
+			writeError(w, http.StatusUnauthorized, "login required")
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	password := a.currentAdminPassword()
+	if password == "" {
+		writeError(w, http.StatusPreconditionRequired, "admin password not configured")
+		return
+	}
+	if subtleConstantTimeCompare(req.Password, password) == false {
+		writeError(w, http.StatusUnauthorized, "invalid password")
+		return
+	}
+	token, err := a.createSession()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	a.setSessionCookie(w, token)
+	writeJSON(w, http.StatusOK, map[string]bool{"authenticated": true})
+}
+
+func (a *API) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	a.clearSessionCookie(w, r)
+	writeJSON(w, http.StatusOK, map[string]bool{"authenticated": false})
+}
+
+func (a *API) handleAuthMe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{
+		"auth_enabled":  a.isAdminAuthEnabled(),
+		"authenticated": a.validSession(r),
+	})
 }
 
 func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -113,6 +190,62 @@ func (a *API) handleCluster(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, a.store.Snapshot())
+}
+
+func (a *API) handleSettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, a.store.Snapshot().Config)
+	case http.MethodPatch:
+		var req struct {
+			AutoMigration     *bool   `json:"auto_migration"`
+			MigrationScoreGap *int    `json:"migration_score_gap"`
+			PublicEntryHost   *string `json:"public_entry_host"`
+			DNSUpdateHook     *string `json:"dns_update_hook"`
+		}
+		if err := readJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		config, err := a.store.UpdateConfig(ConfigUpdate{
+			AutoMigration:     req.AutoMigration,
+			MigrationScoreGap: req.MigrationScoreGap,
+			PublicEntryHost:   req.PublicEntryHost,
+			DNSUpdateHook:     req.DNSUpdateHook,
+		})
+		if err != nil {
+			writeMappedError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, config)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (a *API) handleDNSTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		NodeID   string `json:"node_id"`
+		ClientID string `json:"client_id"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if strings.TrimSpace(req.NodeID) == "" {
+		writeError(w, http.StatusBadRequest, "node_id required")
+		return
+	}
+	result, err := a.store.TestDNSUpdate(req.ClientID, req.NodeID)
+	if err != nil {
+		writeMappedError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"dns": result})
 }
 
 func (a *API) handleTokens(w http.ResponseWriter, r *http.Request) {
@@ -208,6 +341,10 @@ func (a *API) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
+		if !a.validSession(r) {
+			writeError(w, http.StatusUnauthorized, "login required")
+			return
+		}
 		node, err := a.store.AdminLeaveNode(nodeID)
 		if err != nil {
 			writeMappedError(w, err)
@@ -240,12 +377,49 @@ func (a *API) handleClientAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		var dnsResult DNSUpdateResult
+		if strings.TrimSpace(req.NodeID) != "" {
+			var err error
+			dnsResult, err = a.store.UpdateDNSForNode(clientID, req.NodeID)
+			if err != nil {
+				writeMappedError(w, err)
+				return
+			}
+		}
 		client, err := a.store.SetClientTarget(clientID, req.NodeID)
 		if err != nil {
 			writeMappedError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, client)
+		writeJSON(w, http.StatusOK, map[string]any{"client": client, "dns": dnsResult})
+	case "auto-target":
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		var req struct {
+			NodeID string `json:"node_id"`
+			Reason string `json:"reason"`
+		}
+		if err := readJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if strings.TrimSpace(req.NodeID) == "" {
+			writeError(w, http.StatusBadRequest, "node_id required")
+			return
+		}
+		dnsResult, err := a.store.UpdateDNSForNode(clientID, req.NodeID)
+		if err != nil {
+			writeMappedError(w, err)
+			return
+		}
+		client, err := a.store.AutoSwitchClientTarget(clientID, req.NodeID, req.Reason)
+		if err != nil {
+			writeMappedError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"client": client, "dns": dnsResult})
 	default:
 		http.NotFound(w, r)
 	}
@@ -280,10 +454,11 @@ func (a *API) handleFrpcConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	opts := FrpcConfigOptions{
-		ClientID: r.URL.Query().Get("client_id"),
-		Mode:     r.URL.Query().Get("mode"),
-		Limit:    limit,
-		Proxies:  proxies,
+		ClientID:       r.URL.Query().Get("client_id"),
+		Mode:           r.URL.Query().Get("mode"),
+		Limit:          limit,
+		Proxies:        proxies,
+		ExcludeNodeIDs: cleanList(r.URL.Query()["exclude_node"]),
 	}
 	if r.URL.Query().Get("format") == "json" {
 		files, err := a.store.GenerateFrpcConfigFiles(opts)
@@ -446,11 +621,22 @@ func writeMappedError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrInvalidJoinRequest), errors.Is(err, ErrInvalidToken), errors.Is(err, ErrTokenExpired), errors.Is(err, ErrTokenUsed), errors.Is(err, ErrNodeTokenRequired), errors.Is(err, ErrNodeTokenMismatch):
 		writeError(w, http.StatusUnauthorized, err.Error())
-	case errors.Is(err, ErrNodeNotFound), errors.Is(err, ErrNoAvailableNode):
+	case errors.Is(err, ErrNodeNotFound), errors.Is(err, ErrNoAvailableNode), errors.Is(err, ErrClientNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, ErrDNSHookNotConfigured):
+		writeError(w, http.StatusPreconditionRequired, err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, err.Error())
 	}
+}
+
+func subtleConstantTimeCompare(got, want string) bool {
+	gotBytes := []byte(got)
+	wantBytes := []byte(want)
+	if len(gotBytes) != len(wantBytes) {
+		return false
+	}
+	return subtle.ConstantTimeCompare(gotBytes, wantBytes) == 1
 }
 
 func bearerToken(r *http.Request) string {

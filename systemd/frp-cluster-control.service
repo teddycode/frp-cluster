@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/frp-cluster/node.env
-ExecStart=/usr/local/bin/frp-cluster server --listen ${CONTROL_LISTEN} --data ${CONTROL_DATA} --public-url ${NODE_CONTROL_URL} --peer ${BOOTSTRAP_CONTROL_URL}
+ExecStart=/usr/local/bin/frp-cluster server --listen ${CONTROL_LISTEN} --data ${CONTROL_DATA} --public-url ${NODE_CONTROL_URL} --public-entry-host ${PUBLIC_ENTRY_HOST} --dns-update-hook ${DNS_UPDATE_HOOK} --web-dir ${WEB_DIR} --admin-password-file ${ADMIN_PASSWORD_FILE} --peer ${BOOTSTRAP_CONTROL_URL}
 Restart=always
 RestartSec=3
 

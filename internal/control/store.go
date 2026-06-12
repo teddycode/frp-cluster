@@ -18,6 +18,13 @@ type Store struct {
 	state ClusterState
 }
 
+type ControlPlaneOptions struct {
+	PublicURL       string
+	PeerURLs        []string
+	PublicEntryHost string
+	DNSUpdateHook   string
+}
+
 func NewStore(path string) (*Store, error) {
 	s := &Store{path: path}
 	if err := s.load(); err != nil {
@@ -44,11 +51,12 @@ func defaultState() ClusterState {
 			AutoMigration:     &autoMigration,
 			MigrationScoreGap: 15,
 		},
-		Nodes:   map[string]*ServerNode{},
-		Clients: map[string]*Client{},
-		Proxies: map[string]*Proxy{},
-		Tokens:  map[string]*JoinToken{},
-		Events:  []Event{},
+		Nodes:         map[string]*ServerNode{},
+		Clients:       map[string]*Client{},
+		Proxies:       map[string]*Proxy{},
+		Tokens:        map[string]*JoinToken{},
+		Events:        []Event{},
+		SwitchMetrics: map[string]*MonthlySwitch{},
 	}
 }
 
@@ -89,6 +97,9 @@ func (s *Store) ensureMaps() {
 	}
 	if s.state.Events == nil {
 		s.state.Events = []Event{}
+	}
+	if s.state.SwitchMetrics == nil {
+		s.state.SwitchMetrics = map[string]*MonthlySwitch{}
 	}
 	if s.state.Config.Name == "" {
 		s.state.Config.Name = "frp-cluster"
@@ -151,13 +162,30 @@ func (s *Store) Snapshot() ClusterSnapshot {
 	}
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
 
-	clients := make([]Client, 0, len(s.state.Clients))
+	proxiesByClient := map[string][]Proxy{}
+	for _, p := range s.state.Proxies {
+		proxy := *p
+		if !nodeOnline[proxy.NodeID] {
+			proxy.Status = ProxyStatusClosed
+		}
+		proxiesByClient[proxy.ClientID] = append(proxiesByClient[proxy.ClientID], proxy)
+	}
+	for clientID := range proxiesByClient {
+		sort.Slice(proxiesByClient[clientID], func(i, j int) bool {
+			if proxiesByClient[clientID][i].NodeID != proxiesByClient[clientID][j].NodeID {
+				return proxiesByClient[clientID][i].NodeID < proxiesByClient[clientID][j].NodeID
+			}
+			return proxiesByClient[clientID][i].Name < proxiesByClient[clientID][j].Name
+		})
+	}
+
+	clients := make([]ClientView, 0, len(s.state.Clients))
 	for _, c := range s.state.Clients {
 		client := *c
 		if !nodeOnline[client.NodeID] {
 			client.Status = ClientStatusOffline
 		}
-		clients = append(clients, client)
+		clients = append(clients, ClientView{Client: client, Proxies: append([]Proxy(nil), proxiesByClient[client.ID]...)})
 	}
 	sort.Slice(clients, func(i, j int) bool { return clients[i].ID < clients[j].ID })
 
@@ -204,29 +232,80 @@ func (s *Store) Snapshot() ClusterSnapshot {
 		}
 	}
 	summary.AvailablePorts = len(nodes)
+	metrics := make([]MonthlySwitch, 0, len(s.state.SwitchMetrics))
+	for _, metric := range s.state.SwitchMetrics {
+		if metric != nil {
+			metrics = append(metrics, *metric)
+			if metric.Month == currentMonth(time.Now().UTC()) {
+				summary.SwitchesThisMonth = metric.Count
+			}
+		}
+	}
+	sort.Slice(metrics, func(i, j int) bool { return metrics[i].Month > metrics[j].Month })
 
 	return ClusterSnapshot{
-		Config:  s.state.Config,
-		Nodes:   nodes,
-		Clients: clients,
-		Proxies: proxies,
-		Tokens:  tokens,
-		Events:  events,
-		Summary: summary,
+		Config:        s.state.Config,
+		Nodes:         nodes,
+		Clients:       clients,
+		Proxies:       proxies,
+		Tokens:        tokens,
+		Events:        events,
+		Summary:       summary,
+		SwitchMetrics: metrics,
 	}
 }
 
-func (s *Store) ConfigureControlPlane(publicURL string, peerURLs []string) error {
+func (s *Store) ConfigureControlPlane(publicURL string, peerURLs []string, publicEntryHost ...string) error {
+	opts := ControlPlaneOptions{PublicURL: publicURL, PeerURLs: peerURLs}
+	if len(publicEntryHost) > 0 {
+		opts.PublicEntryHost = publicEntryHost[0]
+	}
+	return s.ConfigureControlPlaneWithOptions(opts)
+}
+
+func (s *Store) ConfigureControlPlaneWithOptions(opts ControlPlaneOptions) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if publicURL = normalizeControlURL(publicURL); publicURL != "" {
+	publicURL := normalizeControlURL(opts.PublicURL)
+	if publicURL != "" {
 		s.state.Config.PublicControlURL = publicURL
 	}
-	s.state.Config.PeerURLs = mergePeerURLs(s.state.Config.PeerURLs, peerURLs...)
+	if opts.PublicEntryHost != "" {
+		s.state.Config.PublicEntryHost = strings.TrimSpace(opts.PublicEntryHost)
+	}
+	if opts.DNSUpdateHook != "" {
+		s.state.Config.DNSUpdateHook = strings.TrimSpace(opts.DNSUpdateHook)
+	}
+	s.state.Config.PeerURLs = mergePeerURLs(s.state.Config.PeerURLs, opts.PeerURLs...)
 	if publicURL != "" {
 		s.state.Config.PeerURLs = removePeerURL(s.state.Config.PeerURLs, publicURL)
 	}
 	return s.saveLocked()
+}
+
+func (s *Store) UpdateConfig(update ConfigUpdate) (ClusterConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if update.AutoMigration != nil {
+		value := *update.AutoMigration
+		s.state.Config.AutoMigration = &value
+	}
+	if update.MigrationScoreGap != nil {
+		if *update.MigrationScoreGap < 0 {
+			return ClusterConfig{}, fmt.Errorf("migration score gap must be non-negative")
+		}
+		s.state.Config.MigrationScoreGap = *update.MigrationScoreGap
+	}
+	if update.PublicEntryHost != nil {
+		s.state.Config.PublicEntryHost = strings.TrimSpace(*update.PublicEntryHost)
+	}
+	if update.DNSUpdateHook != nil {
+		s.state.Config.DNSUpdateHook = strings.TrimSpace(*update.DNSUpdateHook)
+	}
+	if err := s.saveLocked(); err != nil {
+		return ClusterConfig{}, err
+	}
+	return s.state.Config, nil
 }
 
 func (s *Store) PeerURLs() []string {
@@ -372,6 +451,13 @@ func (s *Store) addEventLocked(eventType, message, nodeID, clientID, proxyID str
 	if len(s.state.Events) > 500 {
 		s.state.Events = s.state.Events[len(s.state.Events)-500:]
 	}
+}
+
+func currentMonth(now time.Time) string {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	return now.UTC().Format("2006-01")
 }
 
 func copyClusterState(state ClusterState) ClusterState {

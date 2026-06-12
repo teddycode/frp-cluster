@@ -188,8 +188,8 @@ func (s *Store) SelectNodes(mode string, limit int) ([]ServerNode, error) {
 	return s.selectNodesLocked("", mode, limit)
 }
 
-func (s *Store) selectNodesLocked(clientID, mode string, limit int) ([]ServerNode, error) {
-	nodes := s.onlineNodesLocked()
+func (s *Store) selectNodesLocked(clientID, mode string, limit int, excludeNodeIDs ...string) ([]ServerNode, error) {
+	nodes := filterExcludedNodes(s.onlineNodesLocked(), excludeNodeIDs)
 	return selectNodesForClient(nodes, s.state.Clients[sanitizeID(clientID)], mode, limit)
 }
 
@@ -219,13 +219,13 @@ func selectNodesForClient(nodes []ServerNode, client *Client, mode string, limit
 			limit = len(nodes)
 		}
 		if limit == 1 {
-			if pinned, ok := pinnedNode(nodes, client); ok {
+			if pinned, ok := pinnedNode(nodes, client, true); ok {
 				return []ServerNode{pinned}, nil
 			}
 		}
 		return nodes[:limit], nil
 	case ConfigModeSingle, "":
-		if pinned, ok := pinnedNode(nodes, client); ok {
+		if pinned, ok := pinnedNode(nodes, client, true); ok {
 			return []ServerNode{pinned}, nil
 		}
 		return nodes[:1], nil
@@ -234,7 +234,29 @@ func selectNodesForClient(nodes []ServerNode, client *Client, mode string, limit
 	}
 }
 
-func pinnedNode(nodes []ServerNode, client *Client) (ServerNode, bool) {
+func filterExcludedNodes(nodes []ServerNode, excludeNodeIDs []string) []ServerNode {
+	if len(excludeNodeIDs) == 0 {
+		return nodes
+	}
+	excluded := map[string]bool{}
+	for _, nodeID := range excludeNodeIDs {
+		if nodeID = sanitizeID(nodeID); nodeID != "" {
+			excluded[nodeID] = true
+		}
+	}
+	if len(excluded) == 0 {
+		return nodes
+	}
+	out := nodes[:0]
+	for _, node := range nodes {
+		if !excluded[node.ID] {
+			out = append(out, node)
+		}
+	}
+	return out
+}
+
+func pinnedNode(nodes []ServerNode, client *Client, allowCurrentFallback bool) (ServerNode, bool) {
 	if client == nil {
 		return ServerNode{}, false
 	}
@@ -243,7 +265,7 @@ func pinnedNode(nodes []ServerNode, client *Client) (ServerNode, bool) {
 			return node, true
 		}
 	}
-	if client.NodeID != "" {
+	if allowCurrentFallback && client.NodeID != "" {
 		if node, ok := findNode(nodes, client.NodeID); ok {
 			return node, true
 		}
@@ -425,6 +447,7 @@ func (s *Store) SetClientTarget(clientID, nodeID string) (*Client, error) {
 		client.PreferredNodeID = nodeID
 		client.MigrationState = MigrationStateManual
 		client.MigrationReason = "manual switch from control plane"
+		s.recordSwitchLocked(now, false)
 		s.addEventLocked("client.manual_switch", fmt.Sprintf("client %s manually switched to %s", client.ID, nodeID), nodeID, client.ID, "", map[string]string{
 			"to_node": nodeID,
 		}, now)
@@ -441,6 +464,83 @@ func (s *Store) SetClientTarget(clientID, nodeID string) (*Client, error) {
 	}
 	copyClient := *client
 	return &copyClient, nil
+}
+
+func (s *Store) AutoSwitchClientTarget(clientID, nodeID, reason string) (*Client, error) {
+	clientID = sanitizeID(clientID)
+	nodeID = sanitizeID(nodeID)
+	now := time.Now().UTC()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	client := s.state.Clients[clientID]
+	if client == nil {
+		return nil, ErrClientNotFound
+	}
+	node := s.state.Nodes[nodeID]
+	if node == nil {
+		return nil, ErrNodeNotFound
+	}
+	if node.Status != NodeStatusOnline || now.Sub(node.LastSeenAt) > 90*time.Second {
+		return nil, ErrNoAvailableNode
+	}
+	client.PreferredNodeID = nodeID
+	client.MigrationState = MigrationStateManual
+	client.MigrationReason = firstNonEmpty(strings.TrimSpace(reason), "automatic switch from control plane")
+	client.MigrationUpdatedAt = now
+	client.UpdatedAt = now
+	s.recordSwitchLocked(now, true)
+	s.addEventLocked("client.auto_switch", fmt.Sprintf("client %s automatically switched to %s", client.ID, nodeID), nodeID, client.ID, "", map[string]string{
+		"to_node": nodeID,
+		"reason":  client.MigrationReason,
+	}, now)
+	if err := s.saveLocked(); err != nil {
+		return nil, err
+	}
+	copyClient := *client
+	return &copyClient, nil
+}
+
+func (s *Store) AutoSwitchCandidates() []AutoSwitchCandidate {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.state.Config.AutoMigration != nil && !*s.state.Config.AutoMigration {
+		return nil
+	}
+	candidates := make([]AutoSwitchCandidate, 0)
+	for _, client := range s.state.Clients {
+		if client == nil || client.MigrationState != MigrationStatePending || client.PreferredNodeID == "" {
+			continue
+		}
+		candidates = append(candidates, AutoSwitchCandidate{
+			ClientID: client.ID,
+			NodeID:   client.PreferredNodeID,
+			Reason:   client.MigrationReason,
+		})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].ClientID != candidates[j].ClientID {
+			return candidates[i].ClientID < candidates[j].ClientID
+		}
+		return candidates[i].NodeID < candidates[j].NodeID
+	})
+	return candidates
+}
+
+func (s *Store) recordSwitchLocked(now time.Time, automatic bool) {
+	month := currentMonth(now)
+	metric := s.state.SwitchMetrics[month]
+	if metric == nil {
+		metric = &MonthlySwitch{Month: month}
+		s.state.SwitchMetrics[month] = metric
+	}
+	metric.Count++
+	if automatic {
+		metric.Automatic++
+	} else {
+		metric.Manual++
+	}
+	metric.UpdatedAt = now
 }
 
 func (s *Store) recomputeNodeCountsLocked() {

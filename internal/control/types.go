@@ -30,6 +30,7 @@ type ClusterConfig struct {
 	AutoMigration     *bool    `json:"auto_migration"`
 	MigrationScoreGap int      `json:"migration_score_gap"`
 	PublicEntryHost   string   `json:"public_entry_host,omitempty"`
+	DNSUpdateHook     string   `json:"dns_update_hook,omitempty"`
 	PublicControlURL  string   `json:"public_control_url,omitempty"`
 	PeerURLs          []string `json:"peer_urls,omitempty"`
 }
@@ -115,12 +116,13 @@ type Event struct {
 }
 
 type ClusterState struct {
-	Config  ClusterConfig          `json:"config"`
-	Nodes   map[string]*ServerNode `json:"nodes"`
-	Clients map[string]*Client     `json:"clients"`
-	Proxies map[string]*Proxy      `json:"proxies"`
-	Tokens  map[string]*JoinToken  `json:"tokens"`
-	Events  []Event                `json:"events"`
+	Config        ClusterConfig             `json:"config"`
+	Nodes         map[string]*ServerNode    `json:"nodes"`
+	Clients       map[string]*Client        `json:"clients"`
+	Proxies       map[string]*Proxy         `json:"proxies"`
+	Tokens        map[string]*JoinToken     `json:"tokens"`
+	Events        []Event                   `json:"events"`
+	SwitchMetrics map[string]*MonthlySwitch `json:"switch_metrics,omitempty"`
 }
 
 type JoinRequest struct {
@@ -167,19 +169,47 @@ type PluginEvent struct {
 }
 
 type ClusterSnapshot struct {
-	Config  ClusterConfig  `json:"config"`
-	Nodes   []ServerNode   `json:"nodes"`
-	Clients []Client       `json:"clients"`
-	Proxies []Proxy        `json:"proxies"`
-	Tokens  []JoinToken    `json:"tokens"`
-	Events  []Event        `json:"events"`
-	Summary ClusterSummary `json:"summary"`
+	Config        ClusterConfig   `json:"config"`
+	Nodes         []ServerNode    `json:"nodes"`
+	Clients       []ClientView    `json:"clients"`
+	Proxies       []Proxy         `json:"proxies"`
+	Tokens        []JoinToken     `json:"tokens"`
+	Events        []Event         `json:"events"`
+	Summary       ClusterSummary  `json:"summary"`
+	SwitchMetrics []MonthlySwitch `json:"switch_metrics"`
 }
 
 type ClusterSummary struct {
-	OnlineNodes    int `json:"online_nodes"`
-	OfflineNodes   int `json:"offline_nodes"`
-	OnlineClients  int `json:"online_clients"`
-	OnlineProxies  int `json:"online_proxies"`
-	AvailablePorts int `json:"available_ports"`
+	OnlineNodes       int `json:"online_nodes"`
+	OfflineNodes      int `json:"offline_nodes"`
+	OnlineClients     int `json:"online_clients"`
+	OnlineProxies     int `json:"online_proxies"`
+	AvailablePorts    int `json:"available_ports"`
+	SwitchesThisMonth int `json:"switches_this_month"`
+}
+
+type ClientView struct {
+	Client
+	Proxies []Proxy `json:"proxies"`
+}
+
+type MonthlySwitch struct {
+	Month     string    `json:"month"`
+	Count     int       `json:"count"`
+	Manual    int       `json:"manual"`
+	Automatic int       `json:"automatic"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type ConfigUpdate struct {
+	AutoMigration     *bool
+	MigrationScoreGap *int
+	PublicEntryHost   *string
+	DNSUpdateHook     *string
+}
+
+type AutoSwitchCandidate struct {
+	ClientID string `json:"client_id"`
+	NodeID   string `json:"node_id"`
+	Reason   string `json:"reason"`
 }

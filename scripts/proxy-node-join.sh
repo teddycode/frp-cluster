@@ -24,6 +24,10 @@ VHOST_HTTP_PORT="${VHOST_HTTP_PORT:-0}"
 VHOST_HTTPS_PORT="${VHOST_HTTPS_PORT:-0}"
 CONTROL_LISTEN="${CONTROL_LISTEN:-:8080}"
 CONTROL_DATA="${CONTROL_DATA:-/var/lib/frp-cluster/cluster.json}"
+PUBLIC_ENTRY_HOST="${PUBLIC_ENTRY_HOST:-}"
+DNS_UPDATE_HOOK="${DNS_UPDATE_HOOK:-}"
+WEB_DIR="${WEB_DIR:-/usr/local/share/frp-cluster/web}"
+ADMIN_PASSWORD_FILE="${ADMIN_PASSWORD_FILE:-/etc/frp-cluster/admin-password}"
 REGION="${REGION:-}"
 TAGS="${TAGS:-}"
 PROBE_SIZE="${PROBE_SIZE:-262144}"
@@ -32,6 +36,15 @@ JOIN_TOKEN="${JOIN_TOKEN:-auto}"
 install -m 0755 ./bin/frp-cluster /usr/local/bin/frp-cluster
 install -m 0755 ./bin/frps /usr/local/bin/frps
 mkdir -p /etc/frp /etc/frp-cluster "$(dirname "$CONTROL_DATA")"
+if [[ -d ./web ]]; then
+  rm -rf "$WEB_DIR"
+  mkdir -p "$WEB_DIR"
+  cp -a ./web/. "$WEB_DIR/"
+fi
+if [[ ! -f "$ADMIN_PASSWORD_FILE" && "${ADMIN_PASSWORD:-}" != "" ]]; then
+  install -m 0600 /dev/null "$ADMIN_PASSWORD_FILE"
+  printf '%s\n' "$ADMIN_PASSWORD" > "$ADMIN_PASSWORD_FILE"
+fi
 
 cat > /etc/frp-cluster/node.env <<ENVEOF
 BOOTSTRAP_CONTROL_URL=$BOOTSTRAP_CONTROL_URL
@@ -44,6 +57,10 @@ VHOST_HTTP_PORT=$VHOST_HTTP_PORT
 VHOST_HTTPS_PORT=$VHOST_HTTPS_PORT
 CONTROL_LISTEN=$CONTROL_LISTEN
 CONTROL_DATA=$CONTROL_DATA
+PUBLIC_ENTRY_HOST=$PUBLIC_ENTRY_HOST
+DNS_UPDATE_HOOK=$DNS_UPDATE_HOOK
+WEB_DIR=$WEB_DIR
+ADMIN_PASSWORD_FILE=$ADMIN_PASSWORD_FILE
 REGION=$REGION
 TAGS=$TAGS
 PROBE_SIZE=$PROBE_SIZE
@@ -68,7 +85,7 @@ if ! /usr/local/bin/frp-cluster health --control-url "$NODE_CONTROL_URL" --timeo
 fi
 
 if [[ "$JOIN_TOKEN" == "auto" ]]; then
-  JOIN_TOKEN=$(/usr/local/bin/frp-cluster token --control-url "$NODE_CONTROL_URL" --ttl 10m --uses 1)
+  JOIN_TOKEN=$(/usr/local/bin/frp-cluster token --control-url "$NODE_CONTROL_URL" --ttl 10m --uses 1 --admin-password-file "$ADMIN_PASSWORD_FILE")
 fi
 
 JOIN_OUT=$(mktemp)

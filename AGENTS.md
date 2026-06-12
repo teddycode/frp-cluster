@@ -11,3 +11,9 @@
 - 退出方式：在代理服务器上执行 `frp-cluster leave --control-url ... --node-id ... --token ...`。
 - frpc 聚合配置：使用 `frp-cluster config frpc --mode aggregate --proxy name:tcp:127.0.0.1:8080:18080 --out-dir ./frpc.d` 输出多份配置，每份配置对应一个 frpc 进程。
 - 测试命令：`go test ./...`。
+
+## 代码注释
+
+1. 每个go文件开头有一个包注释，说明该包的功能和设计思路。
+2. 主要函数和方法都有注释，说明其功能、输入输出参数和返回值。
+3. 复杂的逻辑块或算法部分有内联注释，解释其工作原理和关键步骤。
