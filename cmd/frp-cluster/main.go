@@ -85,6 +85,9 @@ func runServer(args []string) error {
 	webDir := fs.String("web-dir", "./web/dist", "static web frontend directory")
 	adminPassword := fs.String("admin-password", "", "admin web password; prefer --admin-password-file in production")
 	adminPasswordFile := fs.String("admin-password-file", "", "file containing admin web password")
+	authConfigFile := fs.String("auth-config-file", "/etc/frp-cluster/auth.env", "TOTP authenticator config file")
+	aliDNSConfigFile := fs.String("alidns-config-file", "/etc/frp-cluster/alidns.env", "AliDNS config file managed by the admin UI")
+	nodeEnvFile := fs.String("node-env-file", "/etc/frp-cluster/node.env", "node env file managed by the admin UI")
 	autoSwitchInterval := fs.Duration("auto-switch-interval", 30*time.Second, "interval for applying enabled automatic switch recommendations")
 	peerSyncInterval := fs.Duration("peer-sync-interval", 10*time.Second, "peer state synchronization interval")
 	peers := multiFlag{}
@@ -112,6 +115,9 @@ func runServer(args []string) error {
 		WebDir:            *webDir,
 		AdminPassword:     *adminPassword,
 		AdminPasswordFile: *adminPasswordFile,
+		AuthConfigFile:    *authConfigFile,
+		AliDNSConfigFile:  *aliDNSConfigFile,
+		NodeEnvFile:       *nodeEnvFile,
 	})
 	server := &http.Server{
 		Addr:              *listen,
@@ -520,10 +526,32 @@ func postAdminJSON(controlURL, path string, value any, target any, adminPassword
 		return err
 	}
 	var loginResp map[string]bool
-	if loginErr := postJSONWithClient(client, base+"/api/v1/auth/login", map[string]string{"password": strings.TrimSpace(string(password))}, &loginResp); loginErr != nil {
-		return loginErr
+	if loginErr := postJSONWithClient(client, base+"/api/v1/auth/login", map[string]string{"code": strings.TrimSpace(string(password))}, &loginResp); loginErr != nil {
+		if setupErr := bootstrapTOTPForCLI(client, base, strings.TrimSpace(string(password))); setupErr != nil {
+			return loginErr
+		}
 	}
 	return postJSONWithClient(client, base+path, value, target)
+}
+
+func bootstrapTOTPForCLI(client *http.Client, base, bootstrapPassword string) error {
+	var setup struct {
+		Secret string `json:"secret"`
+	}
+	if err := postJSONWithClient(client, base+"/api/v1/auth/totp/setup", map[string]string{
+		"bootstrap_password": bootstrapPassword,
+		"account":            "cli-bootstrap",
+	}, &setup); err != nil {
+		return err
+	}
+	code := control.GenerateTOTPForCLI(setup.Secret, time.Now())
+	var confirm map[string]bool
+	return postJSONWithClient(client, base+"/api/v1/auth/totp/confirm", map[string]string{
+		"bootstrap_password": bootstrapPassword,
+		"secret":             setup.Secret,
+		"code":               code,
+		"account":            "cli-bootstrap",
+	}, &confirm)
 }
 
 func postJSONWithClient(client *http.Client, url string, value any, target any) error {

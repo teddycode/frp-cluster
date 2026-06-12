@@ -638,7 +638,8 @@ func TestAPIDNSTestRunsHookAndRecordsEvent(t *testing.T) {
 
 func TestAPIAdminAuthProtectsCluster(t *testing.T) {
 	store := NewMemoryStore()
-	server := httptest.NewServer(NewAPIWithOptions(store, RuntimeOptions{AdminPassword: "secret"}).Handler())
+	authFile := filepath.Join(t.TempDir(), "auth.env")
+	server := httptest.NewServer(NewAPIWithOptions(store, RuntimeOptions{AdminPassword: "secret", AuthConfigFile: authFile}).Handler())
 	defer server.Close()
 
 	resp, err := http.Get(server.URL + "/api/v1/cluster")
@@ -651,7 +652,28 @@ func TestAPIAdminAuthProtectsCluster(t *testing.T) {
 	}
 
 	client := server.Client()
-	loginResp, err := client.Post(server.URL+"/api/v1/auth/login", "application/json", strings.NewReader(`{"password":"secret"}`))
+	setupResp, err := client.Post(server.URL+"/api/v1/auth/totp/setup", "application/json", strings.NewReader(`{"bootstrap_password":"secret","account":"admin@example.test"}`))
+	if err != nil {
+		t.Fatalf("setup totp: %v", err)
+	}
+	var setup struct {
+		Secret string `json:"secret"`
+	}
+	if err := json.NewDecoder(setupResp.Body).Decode(&setup); err != nil {
+		t.Fatalf("decode setup: %v", err)
+	}
+	_ = setupResp.Body.Close()
+	code := generateTOTP(setup.Secret, time.Now().Unix()/30)
+	confirmResp, err := client.Post(server.URL+"/api/v1/auth/totp/confirm", "application/json", strings.NewReader(`{"bootstrap_password":"secret","secret":"`+setup.Secret+`","code":"`+code+`","account":"admin@example.test"}`))
+	if err != nil {
+		t.Fatalf("confirm totp: %v", err)
+	}
+	_ = confirmResp.Body.Close()
+	if confirmResp.StatusCode != http.StatusOK {
+		t.Fatalf("confirm status = %d, want ok", confirmResp.StatusCode)
+	}
+	loginCode := generateTOTP(setup.Secret, time.Now().Unix()/30)
+	loginResp, err := client.Post(server.URL+"/api/v1/auth/login", "application/json", strings.NewReader(`{"code":"`+loginCode+`"}`))
 	if err != nil {
 		t.Fatalf("login: %v", err)
 	}
@@ -670,6 +692,46 @@ func TestAPIAdminAuthProtectsCluster(t *testing.T) {
 	_ = authedResp.Body.Close()
 	if authedResp.StatusCode != http.StatusOK {
 		t.Fatalf("authed cluster status = %d, want ok", authedResp.StatusCode)
+	}
+}
+
+func TestAPIAdminConfigUpdatesAliDNSAndAgentSettings(t *testing.T) {
+	store := NewMemoryStore()
+	dir := t.TempDir()
+	aliPath := filepath.Join(dir, "alidns.env")
+	nodeEnvPath := filepath.Join(dir, "node.env")
+	if err := os.WriteFile(nodeEnvPath, []byte("NODE_ID=edge-a\nPROBE_SIZE=262144\nAGENT_INTERVAL=30s\n"), 0o600); err != nil {
+		t.Fatalf("write node env: %v", err)
+	}
+	server := httptest.NewServer(NewAPIWithOptions(store, RuntimeOptions{AliDNSConfigFile: aliPath, NodeEnvFile: nodeEnvPath}).Handler())
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPatch, server.URL+"/api/v1/admin/config", strings.NewReader(`{"alidns":{"access_key_id":"kid","access_key_secret":"secret","domain_name":"buaadcl.tech","ttl":"600"},"agent":{"interval":"15s","probe_size":"131072"}}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("content-type", "application/json")
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("patch admin config: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want ok", resp.StatusCode)
+	}
+	aliValues, err := ReadEnvFile(aliPath)
+	if err != nil {
+		t.Fatalf("read alidns: %v", err)
+	}
+	if aliValues["ALIDNS_ACCESS_KEY_ID"] != "kid" || aliValues["ALIDNS_ACCESS_KEY_SECRET"] != "secret" {
+		t.Fatalf("alidns values = %+v", aliValues)
+	}
+	nodeValues, err := ReadEnvFile(nodeEnvPath)
+	if err != nil {
+		t.Fatalf("read node env: %v", err)
+	}
+	if nodeValues["AGENT_INTERVAL"] != "15s" || nodeValues["PROBE_SIZE"] != "131072" {
+		t.Fatalf("node env = %+v", nodeValues)
 	}
 }
 

@@ -1,19 +1,21 @@
 推理过程的说明性文字请用中文
 
-# frp-cluster 关键信息
+# frp-cluster 项目速记
 
-- 项目目标：基于 frp/frps 构建控制面，实现 frps 代理服务器集群的高可用、负载均衡、多服务器链路聚合配置生成、节点一键加入/退出、状态管理和管理端查看。
-- 架构边界：本项目不修改 frp 数据面协议；通过控制面 API、frps 配置生成、frpc 多端点配置和 frps HTTP 插件回调实现集群编排与可观测。
-- 主要二进制：`frp-cluster`，包含 `server`、`join`、`agent`、`leave`、`token`、`config` 子命令。
-- 默认控制面地址：`:8080`；默认数据文件：`./data/cluster.json`。
-- 管理端入口：启动 `frp-cluster server` 后访问 `http://127.0.0.1:8080/`。
-- frps 接入方式：先由控制面生成加入 token，再在代理服务器上执行 `frp-cluster join --control-url ... --token ... --node-id ... --public-addr ... --write-frps-config ./frps.toml`，然后托管 `frp-cluster agent --control-url ... --node-id ... --token NODE_TOKEN` 持续心跳。
-- 退出方式：在代理服务器上执行 `frp-cluster leave --control-url ... --node-id ... --token ...`。
-- frpc 聚合配置：使用 `frp-cluster config frpc --mode aggregate --proxy name:tcp:127.0.0.1:8080:18080 --out-dir ./frpc.d` 输出多份配置，每份配置对应一个 frpc 进程。
-- 测试命令：`go test ./...`。
+- 项目目标：基于 frp/frps 构建轻量控制面，管理 frps 代理节点集群，提供高可用、负载均衡、链路聚合配置生成、节点加入/退出、状态观测和 Web 管理端。
+- 架构边界：不修改 frp 数据面协议；通过控制面 API、frps 配置生成、frpc 多端点配置、frps HTTP plugin 回调和 peer 状态同步完成编排。
+- 后端：Go 项目，入口 `cmd/frp-cluster`，核心包 `internal/control`；二进制为 `frp-cluster`，包含 `server`、`token`、`join`、`leave`、`agent`、`client`、`health`、`dns`、`config` 子命令。
+- 后端默认：控制面监听 `:8080`，状态文件 `./data/cluster.json`；`server` 同时提供 `/api/v1/*` API 和静态 Web 托管。
+- 前端：前后端分离的 React + Vite + Ant Design 应用，源码在 `web/src`，入口 `web/src/main.jsx`，样式 `web/src/styles.css`，构建产物 `web/dist`。
+- 前端开发：在 `web/` 下运行 `npm run dev`；Vite 将 `/api` 代理到 `http://127.0.0.1:8088`。
+- 生产集成：先运行 `cd web && npm run build` 生成 `web/dist`，再用 `frp-cluster server --web-dir ./web/dist` 托管管理端；默认访问 `http://127.0.0.1:8080/`。
+- 核心流程：创建 join token -> 节点执行 `join` 写入 frps 配置 -> 托管 `agent` 持续心跳 -> 客户端用 `client` 或 `config frpc` 获取 `single`、`failover`、`aggregate` 配置 -> 节点用 `leave` 退出。
+- 关键能力：节点网络评分、客户端迁移建议/切换、阿里云 DNS Hook、TOTP 管理端认证、frps plugin 事件采集、peer 控制面状态同步。
+- 常用文档：`README.md` 是快速开始；`docs/proxy-cluster-deployment.md` 是部署手册；`examples/*.env.example` 是安装脚本配置样例。
+- 常用命令：后端测试 `go test ./...`；后端构建 `go build -o ./bin/frp-cluster ./cmd/frp-cluster`；前端构建 `cd web && npm run build`；发布打包 `./scripts/package-release.sh`。
 
 ## 代码注释
 
-1. 每个go文件开头有一个包注释，说明该包的功能和设计思路。
-2. 主要函数和方法都有注释，说明其功能、输入输出参数和返回值。
-3. 复杂的逻辑块或算法部分有内联注释，解释其工作原理和关键步骤。
+1. 每个 Go 文件开头应有包注释，说明该包的功能和设计思路。
+2. 主要函数和方法应有注释，说明功能、输入输出参数和返回值。
+3. 复杂逻辑块应有简短内联注释，解释工作原理和关键步骤。

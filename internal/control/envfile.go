@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -47,5 +49,47 @@ func unquoteEnvValue(value string) string {
 	value = strings.ReplaceAll(value, `\n`, "\n")
 	value = strings.ReplaceAll(value, `\"`, `"`)
 	value = strings.ReplaceAll(value, `\'`, `'`)
+	return value
+}
+
+func WriteEnvFile(path string, values map[string]string, perm os.FileMode) error {
+	if perm == 0 {
+		perm = 0o600
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, key := range keys {
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		b.WriteString(key)
+		b.WriteByte('=')
+		b.WriteString(shellEnvValue(values[key]))
+		b.WriteByte('\n')
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(b.String()), perm); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func shellEnvValue(value string) string {
+	if value == "" {
+		return "''"
+	}
+	if strings.ContainsAny(value, " \t\n'\"$`\\#") {
+		return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+	}
 	return value
 }

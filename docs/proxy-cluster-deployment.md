@@ -104,9 +104,12 @@ PUBLIC_ENTRY_HOST=ssh.buaadcl.tech
 DNS_UPDATE_HOOK=/usr/local/bin/frp-cluster-alidns-update
 WEB_DIR=/usr/local/share/frp-cluster/web
 ADMIN_PASSWORD_FILE=/etc/frp-cluster/admin-password
+AUTH_CONFIG_FILE=/etc/frp-cluster/auth.env
+ALIDNS_CONFIG_FILE=/etc/frp-cluster/alidns.env
 
 REGION=
 TAGS=
+AGENT_INTERVAL=30s
 PROBE_SIZE=262144
 EOF
 ```
@@ -188,6 +191,17 @@ http://新代理节点公网IP:8088/
 ```
 
 如果浏览器打不开，但服务器本机 `frp-cluster health --control-url http://127.0.0.1:8088` 正常，优先检查云安全组和防火墙是否放行 `8088/tcp`。
+
+首次打开控制面时，进入“绑定 Microsoft Authenticator”流程：
+
+```text
+1. 输入 /etc/frp-cluster/admin-password 中的初始化口令。
+2. 用 Microsoft Authenticator 扫描页面二维码。
+3. 输入 App 中显示的 6 位动态验证码完成绑定。
+4. 后续登录只使用 Microsoft Authenticator 动态验证码。
+```
+
+控制面“阿里云 DNS”页面可以维护 `AccessKey ID`、`AccessKey Secret`、主域名、TTL、解析线路等配置；Secret 留空保存时会保留服务器上的旧值。控制面“运维向导”页面可以调整代理节点网络信息上报间隔 `AGENT_INTERVAL` 和主动测速大小 `PROBE_SIZE`，保存后按提示重启 `frp-cluster-agent` 生效。
 
 ## 二、客户端把本地端口代理到集群
 

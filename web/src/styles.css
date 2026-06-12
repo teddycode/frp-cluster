@@ -6,40 +6,44 @@ body,
 }
 
 body {
-  background: #f4f6f8;
-  color: #1f2933;
+  background: #f5f7fb;
+  color: #1f2937;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   letter-spacing: 0;
 }
 
-.app-shell {
+.admin-shell {
   min-height: 100vh;
 }
 
-.side-nav {
+.admin-sider {
   background: #111827 !important;
+  border-right: 1px solid #0f172a;
+}
+
+.brand-block {
+  height: 72px;
+  padding: 16px 18px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
   color: #fff;
-  padding: 22px 18px;
 }
 
-.brand {
-  font-size: 20px;
-  font-weight: 700;
-  margin-bottom: 28px;
+.brand-title {
+  font-weight: 750;
+  line-height: 1.1;
 }
 
-.nav-actions {
-  width: 100%;
+.brand-subtitle {
+  color: #9ca3af;
+  font-size: 12px;
+  margin-top: 2px;
 }
 
-.nav-actions .ant-btn {
-  width: 100%;
-  justify-content: flex-start;
-}
-
-.topbar {
-  height: 78px;
-  padding: 14px 24px;
+.admin-header {
+  height: 72px;
+  padding: 12px 24px;
   background: #fff;
   border-bottom: 1px solid #e5e7eb;
   display: flex;
@@ -47,24 +51,51 @@ body {
   justify-content: space-between;
 }
 
-.topbar .ant-typography {
+.admin-header .ant-typography {
   margin: 0;
 }
 
-.content {
+.admin-content {
   padding: 20px 24px 32px;
-}
-
-.entry-alert {
-  margin: 16px 0;
-}
-
-.client-target-select {
-  min-width: 190px;
 }
 
 .full {
   width: 100%;
+}
+
+.client-target-select {
+  min-width: 180px;
+}
+
+.event-row {
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr);
+  gap: 4px 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid #eef2f7;
+}
+
+.event-row .ant-typography:last-child {
+  grid-column: 1 / -1;
+  font-size: 12px;
+}
+
+.command-card pre {
+  margin: 12px 0 0;
+  padding: 14px;
+  min-height: 88px;
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-radius: 6px;
+  background: #0f172a;
+  color: #d1fae5;
+}
+
+.command-head {
+  width: 100%;
+  justify-content: space-between;
 }
 
 .loading-state {
@@ -78,48 +109,57 @@ body {
   min-height: 100vh;
   display: grid;
   place-items: center;
-  background: #f4f6f8;
+  background: linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
 }
 
 .login-panel {
-  width: min(400px, calc(100vw - 32px));
-  padding: 28px;
+  width: min(430px, calc(100vw - 32px));
+  padding: 30px;
   background: #fff;
   border: 1px solid #e5e7eb;
   border-radius: 8px;
-  box-shadow: 0 16px 40px rgba(15, 23, 42, 0.08);
+  box-shadow: 0 18px 50px rgba(15, 23, 42, 0.1);
 }
 
-.command-card pre {
-  margin: 12px 0 0;
+.login-panel .ant-typography {
+  margin: 0;
+}
+
+.login-avatar {
+  background: #1677ff;
+}
+
+.login-form {
+  margin-top: 22px;
+}
+
+.qr-box {
+  display: grid;
+  place-items: center;
   padding: 14px;
-  min-height: 96px;
-  overflow: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-  border-radius: 6px;
-  background: #111827;
-  color: #d1fae5;
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  background: #f8fafc;
 }
 
-.command-head {
-  width: 100%;
-  justify-content: space-between;
+.qr-box img {
+  width: 220px;
+  height: 220px;
 }
 
-@media (max-width: 900px) {
-  .side-nav {
+@media (max-width: 920px) {
+  .admin-sider {
     display: none;
   }
 
-  .topbar {
+  .admin-header {
     height: auto;
     gap: 12px;
-    align-items: flex-start;
     flex-direction: column;
+    align-items: flex-start;
   }
 
-  .content {
+  .admin-content {
     padding: 16px;
   }
 }

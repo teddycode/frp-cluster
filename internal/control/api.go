@@ -1,13 +1,13 @@
 package control
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -20,11 +20,15 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/auth/login", a.handleLogin)
 	mux.HandleFunc("/api/v1/auth/logout", a.handleLogout)
 	mux.HandleFunc("/api/v1/auth/me", a.handleAuthMe)
+	mux.HandleFunc("/api/v1/auth/totp/setup", a.handleTOTPSetup)
+	mux.HandleFunc("/api/v1/auth/totp/confirm", a.handleTOTPConfirm)
 	mux.HandleFunc("/api/v1/health", a.handleHealth)
 	mux.HandleFunc("/api/v1/network/probe", a.handleNetworkProbe)
 	mux.HandleFunc("/api/v1/cluster", a.requireAdmin(a.handleCluster))
 	mux.HandleFunc("/api/v1/dns/test", a.requireAdmin(a.handleDNSTest))
 	mux.HandleFunc("/api/v1/settings", a.requireAdmin(a.handleSettings))
+	mux.HandleFunc("/api/v1/admin/config", a.requireAdmin(a.handleAdminConfig))
+	mux.HandleFunc("/api/v1/admin/agent/restart", a.requireAdmin(a.handleRestartAgent))
 	mux.HandleFunc("/api/v1/tokens", a.requireAdmin(a.handleTokens))
 	mux.HandleFunc("/api/v1/nodes/join", a.handleJoinNode)
 	mux.HandleFunc("/api/v1/nodes/", a.handleNodeAction)
@@ -88,19 +92,19 @@ func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Password string `json:"password"`
+		Code string `json:"code"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	password := a.currentAdminPassword()
-	if password == "" {
-		writeError(w, http.StatusPreconditionRequired, "admin password not configured")
+	cfg, err := a.currentTOTPConfig()
+	if err != nil {
+		writeError(w, http.StatusPreconditionRequired, "authenticator not configured")
 		return
 	}
-	if subtleConstantTimeCompare(req.Password, password) == false {
-		writeError(w, http.StatusUnauthorized, "invalid password")
+	if !VerifyTOTP(cfg.Secret, req.Code, time.Now()) {
+		writeError(w, http.StatusUnauthorized, "invalid authenticator code")
 		return
 	}
 	token, err := a.createSession()
@@ -127,9 +131,92 @@ func (a *API) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{
-		"auth_enabled":  a.isAdminAuthEnabled(),
-		"authenticated": a.validSession(r),
+		"auth_enabled":       a.isAdminAuthEnabled(),
+		"authenticated":      a.validSession(r),
+		"totp_configured":    a.totpConfigured(),
+		"bootstrap_required": !a.totpConfigured(),
 	})
+}
+
+func (a *API) allowTOTPBootstrap(r *http.Request, bootstrapPassword string) bool {
+	if a.validSession(r) {
+		return true
+	}
+	password := a.currentAdminPassword()
+	if password == "" {
+		return false
+	}
+	return constantTimeStringEqual(strings.TrimSpace(bootstrapPassword), password)
+}
+
+func (a *API) handleTOTPSetup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		BootstrapPassword string `json:"bootstrap_password"`
+		Account           string `json:"account"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !a.allowTOTPBootstrap(r, req.BootstrapPassword) {
+		writeError(w, http.StatusUnauthorized, "bootstrap authorization required")
+		return
+	}
+	secret, err := NewTOTPSecret()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	account := strings.TrimSpace(req.Account)
+	if account == "" {
+		account = "admin"
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"secret":      secret,
+		"issuer":      "frp-cluster",
+		"account":     account,
+		"otpauth_uri": TOTPURI("frp-cluster", account, secret),
+	})
+}
+
+func (a *API) handleTOTPConfirm(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		BootstrapPassword string `json:"bootstrap_password"`
+		Secret            string `json:"secret"`
+		Code              string `json:"code"`
+		Account           string `json:"account"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !a.allowTOTPBootstrap(r, req.BootstrapPassword) {
+		writeError(w, http.StatusUnauthorized, "bootstrap authorization required")
+		return
+	}
+	if !VerifyTOTP(req.Secret, req.Code, time.Now()) {
+		writeError(w, http.StatusUnauthorized, "invalid authenticator code")
+		return
+	}
+	if err := a.writeTOTPConfig(TOTPConfig{Secret: req.Secret, Issuer: "frp-cluster", Account: req.Account}); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	token, err := a.createSession()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	a.setSessionCookie(w, token)
+	writeJSON(w, http.StatusOK, map[string]bool{"authenticated": true, "totp_configured": true})
 }
 
 func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -221,6 +308,79 @@ func (a *API) handleSettings(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func (a *API) handleAdminConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		a.writeAdminConfig(w)
+	case http.MethodPatch:
+		var req struct {
+			AliDNS *AliDNSSettings `json:"alidns"`
+			Agent  *AgentSettings  `json:"agent"`
+		}
+		if err := readJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if req.AliDNS != nil {
+			if a.aliDNSConfigFile == "" {
+				writeError(w, http.StatusPreconditionRequired, "alidns config file not configured")
+				return
+			}
+			if err := WriteAliDNSSettings(a.aliDNSConfigFile, *req.AliDNS); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+		if req.Agent != nil {
+			if a.nodeEnvFile == "" {
+				writeError(w, http.StatusPreconditionRequired, "node env file not configured")
+				return
+			}
+			if err := WriteAgentSettings(a.nodeEnvFile, *req.Agent); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+		a.writeAdminConfig(w)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (a *API) writeAdminConfig(w http.ResponseWriter) {
+	var ali AliDNSSettings
+	if a.aliDNSConfigFile != "" {
+		ali, _ = ReadAliDNSSettings(a.aliDNSConfigFile)
+	}
+	var agent AgentSettings
+	if a.nodeEnvFile != "" {
+		agent, _ = ReadAgentSettings(a.nodeEnvFile)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"alidns": ali,
+		"agent":  agent,
+		"paths": map[string]string{
+			"alidns_config": a.aliDNSConfigFile,
+			"node_env":      a.nodeEnvFile,
+			"auth_config":   a.authConfigFile,
+		},
+	})
+}
+
+func (a *API) handleRestartAgent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	cmd := exec.Command("systemctl", "restart", "frp-cluster-agent")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, strings.TrimSpace(string(output)))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "restarted"})
 }
 
 func (a *API) handleDNSTest(w http.ResponseWriter, r *http.Request) {
@@ -630,13 +790,17 @@ func writeMappedError(w http.ResponseWriter, err error) {
 	}
 }
 
-func subtleConstantTimeCompare(got, want string) bool {
+func constantTimeStringEqual(got, want string) bool {
 	gotBytes := []byte(got)
 	wantBytes := []byte(want)
 	if len(gotBytes) != len(wantBytes) {
 		return false
 	}
-	return subtle.ConstantTimeCompare(gotBytes, wantBytes) == 1
+	var diff byte
+	for i := range gotBytes {
+		diff |= gotBytes[i] ^ wantBytes[i]
+	}
+	return diff == 0
 }
 
 func bearerToken(r *http.Request) string {
