@@ -23,6 +23,10 @@ import (
 )
 
 func main() {
+	if err := loadProjectEnv(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
@@ -83,11 +87,12 @@ func runServer(args []string) error {
 	publicEntryHost := fs.String("public-entry-host", "", "stable DNS entry users should connect to")
 	dnsUpdateHook := fs.String("dns-update-hook", "", "executable hook to update the stable DNS entry before manual switch")
 	webDir := fs.String("web-dir", "./web/dist", "static web frontend directory")
-	adminPassword := fs.String("admin-password", "", "admin web password; prefer --admin-password-file in production")
-	adminPasswordFile := fs.String("admin-password-file", "", "file containing admin web password")
-	authConfigFile := fs.String("auth-config-file", "/etc/frp-cluster/auth.env", "TOTP authenticator config file")
-	aliDNSConfigFile := fs.String("alidns-config-file", "/etc/frp-cluster/alidns.env", "AliDNS config file managed by the admin UI")
-	nodeEnvFile := fs.String("node-env-file", "/etc/frp-cluster/node.env", "node env file managed by the admin UI")
+	authToken := fs.String("auth-token", envString("FRP_CLUSTER_AUTH_TOKEN", ""), "shared frp auth token; prefer FRP_CLUSTER_AUTH_TOKEN in .env")
+	adminPassword := fs.String("admin-password", envString("FRP_CLUSTER_ADMIN_PASSWORD", ""), "admin web password; prefer FRP_CLUSTER_ADMIN_PASSWORD in .env or --admin-password-file in production")
+	adminPasswordFile := fs.String("admin-password-file", envString("FRP_CLUSTER_ADMIN_PASSWORD_FILE", ""), "file containing admin web password")
+	authConfigFile := fs.String("auth-config-file", envString("FRP_CLUSTER_AUTH_CONFIG_FILE", "/etc/frp-cluster/auth.env"), "TOTP authenticator config file")
+	aliDNSConfigFile := fs.String("alidns-config-file", envString("FRP_CLUSTER_ALIDNS_CONFIG_FILE", "/etc/frp-cluster/alidns.env"), "AliDNS config file managed by the admin UI")
+	nodeEnvFile := fs.String("node-env-file", envString("FRP_CLUSTER_NODE_ENV_FILE", "/etc/frp-cluster/node.env"), "node env file managed by the admin UI")
 	autoSwitchInterval := fs.Duration("auto-switch-interval", 30*time.Second, "interval for applying enabled automatic switch recommendations")
 	peerSyncInterval := fs.Duration("peer-sync-interval", 10*time.Second, "peer state synchronization interval")
 	peers := multiFlag{}
@@ -104,6 +109,7 @@ func runServer(args []string) error {
 		PeerURLs:        peers,
 		PublicEntryHost: *publicEntryHost,
 		DNSUpdateHook:   *dnsUpdateHook,
+		AuthToken:       *authToken,
 	}); err != nil {
 		return err
 	}
@@ -162,6 +168,36 @@ func runDNS(args []string) error {
 	default:
 		return fmt.Errorf("unknown dns command %q", args[0])
 	}
+}
+
+func loadProjectEnv() error {
+	envFile := strings.TrimSpace(os.Getenv("FRP_CLUSTER_ENV_FILE"))
+	if envFile == "" {
+		envFile = ".env"
+	}
+	values, err := control.ReadEnvFile(envFile)
+	if err != nil {
+		if os.IsNotExist(err) && envFile == ".env" {
+			return nil
+		}
+		return fmt.Errorf("load env file %s: %w", envFile, err)
+	}
+	for key, value := range values {
+		if _, exists := os.LookupEnv(key); !exists {
+			if err := os.Setenv(key, value); err != nil {
+				return fmt.Errorf("set env %s: %w", key, err)
+			}
+		}
+	}
+	return nil
+}
+
+func envString(key, fallback string) string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	return value
 }
 
 func runPeerSync(store *control.Store, publicURL string, interval time.Duration) {

@@ -3,6 +3,7 @@
 /output/
 /data/
 *.log
+*.env
 dist/
 *.env.local
 alidns.env

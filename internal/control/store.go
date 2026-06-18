@@ -23,6 +23,7 @@ type ControlPlaneOptions struct {
 	PeerURLs        []string
 	PublicEntryHost string
 	DNSUpdateHook   string
+	AuthToken       string
 }
 
 func NewStore(path string) (*Store, error) {
@@ -279,6 +280,9 @@ func (s *Store) ConfigureControlPlaneWithOptions(opts ControlPlaneOptions) error
 	}
 	if opts.DNSUpdateHook != "" {
 		s.state.Config.DNSUpdateHook = strings.TrimSpace(opts.DNSUpdateHook)
+	}
+	if opts.AuthToken != "" {
+		s.state.Config.AuthToken = strings.TrimSpace(opts.AuthToken)
 	}
 	s.state.Config.PeerURLs = mergePeerURLs(s.state.Config.PeerURLs, opts.PeerURLs...)
 	if publicURL != "" {
